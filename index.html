@@ -432,10 +432,15 @@ function updateBullets(dt) {
   }
   bullets = bullets.filter(b => b.life > 0);
 
-  // remote bullets — visual only
+  // remote bullets — visual only, but collide with walls so they look consistent
   for (const b of rbullets) {
     b.life -= dt; b.x += b.vx*dt; b.y += b.vy*dt;
-    if (b.x < 0 || b.x > W || b.y < 0 || b.y > FLOOR_Y) b.life = 0;
+    if (b.x < 0 || b.x > W || b.y < 0 || b.y > FLOOR_Y) { b.life = 0; continue; }
+    for (const s of obstacles) {
+      if (b.x > s.x && b.x < s.x+s.w && b.y > s.y && b.y < s.y+s.h) {
+        spawnBurst(b.x, b.y, '#fe7', 4, 200); b.life = 0; break;
+      }
+    }
   }
   rbullets = rbullets.filter(b => b.life > 0);
 }
