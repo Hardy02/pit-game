@@ -27,6 +27,25 @@
   #join button:hover { background:#3c8; }
   #status { color:#a55; font-size:13px; min-height:16px; }
   .controls { color:#556; font-size:12px; line-height:1.7; }
+  /* mode picker */
+  .modepick { display:flex; gap:0; border:2px solid #34344a; border-radius:6px; overflow:hidden; }
+  .modebtn {
+    background:#1c1c28; border:none; color:#89a; font-family:inherit; font-size:15px; font-weight:bold;
+    padding:10px 26px; cursor:pointer; letter-spacing:1px; border-radius:0;
+  }
+  .modebtn.active { background:#39c; color:#fff; }
+  .modebtn:hover:not(.active) { background:#23233a; }
+  .modehint { color:#667; font-size:12px; min-height:14px; margin-top:-8px; }
+  /* private game row */
+  .privrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:center; }
+  .privrow .secondary {
+    background:#2a2a3a; color:#cdd; font-size:14px; font-weight:bold; padding:9px 18px; letter-spacing:1px;
+  }
+  .privrow .secondary:hover { background:#363650; }
+  .privrow .or { color:#556; font-size:13px; }
+  #code {
+    width:120px; font-size:18px; padding:8px 10px; text-transform:uppercase; letter-spacing:4px;
+  }
 </style>
 </head>
 <body>
@@ -37,9 +56,21 @@
 <div id="join">
   <h1>PIT</h1>
   <p>Free-for-all arena deathmatch. Out-move and out-shoot everyone else.<br>
-     String together 5 quick kills to earn a <b style="color:#5f5">lightsaber</b> that one-shots anyone it touches.</p>
+     String together 5 quick kills to earn a <b style="color:#5f5">lightsaber</b> that one-shots anyone it touches.<br>
+     Empty servers are filled with <b style="color:#fc6">bots</b> so you're never alone.</p>
   <input id="name" maxlength="14" placeholder="your name" autocomplete="off">
-  <button id="play">PLAY</button>
+  <div class="modepick">
+    <button type="button" class="modebtn active" data-mode="mini">MINI PIT</button>
+    <button type="button" class="modebtn" data-mode="maxi">MAXI PIT</button>
+  </div>
+  <div class="modehint" id="modehint">single-screen arena — the whole map is visible at once</div>
+  <button id="play">QUICK PLAY</button>
+  <div class="privrow">
+    <button type="button" id="createBtn" class="secondary">CREATE PRIVATE GAME</button>
+    <span class="or">— or join a friend —</span>
+    <input id="code" maxlength="4" placeholder="CODE" autocomplete="off">
+    <button type="button" id="joinBtn" class="secondary">JOIN</button>
+  </div>
   <div id="status"></div>
   <div class="controls">
     A / D — move &nbsp;·&nbsp; W — jump (double-jump) &nbsp;·&nbsp; S / Shift — slide<br>
@@ -93,8 +124,19 @@ const TUNE = {
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-const W = TUNE.VIEW_W, H = TUNE.VIEW_H;
-const FLOOR_Y = H - 40;       // top of the arena floor
+const W = TUNE.VIEW_W, H = TUNE.VIEW_H;   // viewport (canvas) size — constant
+
+// The WORLD can be larger than the viewport (maxi mode). The camera is a window
+// into it that follows the local player. In mini mode world === viewport and the
+// camera stays pinned at (0,0) so the whole arena is visible.
+let world = { w: W, h: H, floorY: H - 40 };
+let cam = { x: 0, y: 0 };
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+function updateCamera() {
+  cam.x = world.w <= W ? 0 : clamp(player.x - W / 2, 0, world.w - W);
+  cam.y = world.h <= H ? 0 : clamp((player.y + player.h / 2) - H / 2, 0, world.h - H);
+}
 
 function fit() {
   const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
@@ -107,16 +149,22 @@ window.addEventListener('resize', fit); fit();
 let ws = null;
 const net = {
   connected: false, id: null, room: '', maxHp: 100,
+  mode: 'mini', code: null,
   map: null, mapName: '', roundEndsAt: 0, warmup: false, need: 2,
   others: new Map(),    // id -> remote player render state
   me: null,             // server-authoritative bits about us (hp, dead, score)
 };
 
-function connect(name) {
+function connect(opts) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
-  ws.onopen = () => { ws.send(JSON.stringify({ t: 'join', name })); };
-  ws.onclose = () => { net.connected = false; setStatus('disconnected — refresh to rejoin'); };
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      t: 'join', name: opts.name, mode: opts.mode,
+      create: !!opts.create, code: opts.code || undefined,
+    }));
+  };
+  ws.onclose = () => { if (net.connected) { net.connected = false; setStatus('disconnected — refresh to rejoin'); } };
   ws.onerror = () => { setStatus('connection error — is the server running?'); };
   ws.onmessage = (ev) => onServerMessage(JSON.parse(ev.data));
 }
@@ -126,9 +174,21 @@ function onServerMessage(m) {
   switch (m.t) {
     case 'welcome':
       net.connected = true; net.id = m.id; net.room = m.room; net.maxHp = m.maxHp;
+      net.mode = m.mode || 'mini'; net.code = m.code || null;
       loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
       player.x = m.spawn[0]; player.y = m.spawn[1]; player.vx = player.vy = 0;
+      updateCamera();
       hideJoin();
+      if (net.code) {
+        state.roundBannerText = 'PRIVATE GAME · CODE ' + net.code;
+        state.roundBannerSub = 'share this code so friends can join';
+        state.roundBannerUntil = performance.now() + 7000;
+      }
+      break;
+    case 'joinError':
+      net.connected = false;
+      try { ws.close(); } catch (e) {}
+      setStatus(m.msg || 'Could not join that game.');
       break;
     case 'mapChange':
       loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
@@ -136,6 +196,7 @@ function onServerMessage(m) {
       state.roundBannerText = m.winnerName
         ? `ROUND OVER — ${m.winnerName} wins (${m.winnerScore})`
         : 'ROUND OVER';
+      state.roundBannerSub = 'next map: ' + (m.mapName || '');
       state.roundBannerUntil = performance.now() + 4500;
       break;
     case 'respawn':
@@ -183,13 +244,15 @@ function onServerMessage(m) {
 
 function loadMap(map, name) {
   net.map = map; net.mapName = name;
+  // world size comes from the server (maxi maps are larger than the viewport)
+  world.w = map.w || W; world.h = map.h || H; world.floorY = world.h - 40;
   // build solid list: interior platforms + floor (sides/ceiling handled by clamp)
   obstacles = map.plats.map(p => ({ x: p[0], y: p[1], w: p[2], h: p[3] }));
 }
 
 /* ---------------------------- Input ---------------------------- */
 const keys = {};
-const mouse = { x: W/2, y: H/2 };
+const mouse = { sx: W/2, sy: H/2 };   // viewport-space cursor; world pos = sx+cam.x
 let keysPressedThisFrame = {};
 let jumpBufferTimer = 0;
 let queueMelee = false, queueRanged = false;
@@ -206,8 +269,8 @@ window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
 function mousePos(e) {
   const r = canvas.getBoundingClientRect();
-  mouse.x = (e.clientX - r.left) / r.width * W;
-  mouse.y = (e.clientY - r.top) / r.height * H;
+  mouse.sx = (e.clientX - r.left) / r.width * W;
+  mouse.sy = (e.clientY - r.top) / r.height * H;
 }
 canvas.addEventListener('mousemove', mousePos);
 canvas.addEventListener('mousedown', e => {
@@ -218,13 +281,14 @@ canvas.addEventListener('mousedown', e => {
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 
 function aimAngle() {
-  return Math.atan2(mouse.y - (player.y + player.h/2), mouse.x - player.x);
+  const mx = mouse.sx + cam.x, my = mouse.sy + cam.y;   // cursor in world space
+  return Math.atan2(my - (player.y + player.h/2), mx - player.x);
 }
 
 /* ---------------------------- Local player ---------------------------- */
 let obstacles = [];
 const player = {
-  x: W/2, y: FLOOR_Y - TUNE.PLAYER_H, vx: 0, vy: 0,
+  x: W/2, y: (H - 40) - TUNE.PLAYER_H, vx: 0, vy: 0,
   w: TUNE.PLAYER_W, h: TUNE.PLAYER_H, facing: 1,
   onGround: false, jumpsUsed: 0, coyoteTimer: 0,
   sliding: false, slideTimer: 0,
@@ -236,7 +300,7 @@ const player = {
 const state = {
   time: 0, shake: 0, flash: 0,
   killTimes: [], saberTimer: 0, lastSaberHit: {},
-  roundBannerText: '', roundBannerUntil: 0,
+  roundBannerText: '', roundBannerSub: '', roundBannerUntil: 0,
 };
 
 let bullets = [];       // local, real (do hit detection)
@@ -256,7 +320,7 @@ function aabb(a, b) { return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && 
 function collideWorld(dt) {
   player.onGround = false;
   let wallSide = 0;
-  const floor = { x: 0, y: FLOOR_Y, w: W, h: H - FLOOR_Y };
+  const floor = { x: 0, y: world.floorY, w: world.w, h: world.h - world.floorY };
   const solids = obstacles.concat([floor]);
   const r = playerRect();
 
@@ -272,7 +336,7 @@ function collideWorld(dt) {
   }
   // arena side walls
   if (nx < 0) { nx = 0; wallSide = -1; player.vx = 0; }
-  if (nx + r.w > W) { nx = W - r.w; wallSide = 1; player.vx = 0; }
+  if (nx + r.w > world.w) { nx = world.w - r.w; wallSide = 1; player.vx = 0; }
   player.x = nx + r.w/2;
 
   // vertical
@@ -298,7 +362,7 @@ function wallBeside() {
   let side = 0;
   for (const s of obstacles) { if (aabb(pl, s)) side = -1; if (aabb(pr, s)) side = 1; }
   if (r.x <= TUNE.WALL_STICK_RANGE) side = -1;
-  if (r.x + r.w >= W - TUNE.WALL_STICK_RANGE) side = 1;
+  if (r.x + r.w >= world.w - TUNE.WALL_STICK_RANGE) side = 1;
   return side;
 }
 
@@ -427,7 +491,7 @@ function updateBullets(dt) {
   // local bullets — collide with walls + remote players (claim hits)
   for (const b of bullets) {
     b.life -= dt; b.x += b.vx*dt; b.y += b.vy*dt;
-    if (b.x < 0 || b.x > W || b.y < 0 || b.y > FLOOR_Y) { b.life = 0; continue; }
+    if (b.x < 0 || b.x > world.w || b.y < 0 || b.y > world.floorY) { b.life = 0; continue; }
     let hit = false;
     for (const s of obstacles) if (b.x>s.x && b.x<s.x+s.w && b.y>s.y && b.y<s.y+s.h) { hit = true; break; }
     if (hit) { spawnBurst(b.x, b.y, '#fe7', 4, 200); b.life = 0; continue; }
@@ -442,7 +506,7 @@ function updateBullets(dt) {
   // remote bullets — visual only, but collide with walls so they look consistent
   for (const b of rbullets) {
     b.life -= dt; b.x += b.vx*dt; b.y += b.vy*dt;
-    if (b.x < 0 || b.x > W || b.y < 0 || b.y > FLOOR_Y) { b.life = 0; continue; }
+    if (b.x < 0 || b.x > world.w || b.y < 0 || b.y > world.floorY) { b.life = 0; continue; }
     for (const s of obstacles) {
       if (b.x > s.x && b.x < s.x+s.w && b.y > s.y && b.y < s.y+s.h) {
         spawnBurst(b.x, b.y, '#fe7', 4, 200); b.life = 0; break;
@@ -537,18 +601,22 @@ function render() {
   if (state.flash > 0)      { ctx.fillStyle = '#f44'; ctx.globalAlpha = state.flash*0.18; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1; }
 
   ctx.save();
-  if (state.shake > 0) ctx.translate((Math.random()-0.5)*state.shake, (Math.random()-0.5)*state.shake);
+  // camera: translate the world so the local player stays centred (maxi). In mini
+  // the camera is pinned at 0,0 so this is just the optional screen shake.
+  let shx = 0, shy = 0;
+  if (state.shake > 0) { shx = (Math.random()-0.5)*state.shake; shy = (Math.random()-0.5)*state.shake; }
+  ctx.translate(-cam.x + shx, -cam.y + shy);
 
   // floor
-  ctx.fillStyle = '#23232f'; ctx.fillRect(0, FLOOR_Y, W, H-FLOOR_Y);
-  ctx.fillStyle = '#2d2d3d'; ctx.fillRect(0, FLOOR_Y, W, 4);
+  ctx.fillStyle = '#23232f'; ctx.fillRect(0, world.floorY, world.w, world.h-world.floorY);
+  ctx.fillStyle = '#2d2d3d'; ctx.fillRect(0, world.floorY, world.w, 4);
   // platforms
   for (const s of obstacles) {
     ctx.fillStyle = '#262633'; ctx.fillRect(s.x, s.y, s.w, s.h);
     ctx.fillStyle = '#34344a'; ctx.fillRect(s.x, s.y, s.w, 4);
     ctx.fillStyle = '#1c1c27'; ctx.fillRect(s.x, s.y, 3, s.h); ctx.fillRect(s.x+s.w-3, s.y, 3, s.h);
   }
-  ctx.strokeStyle = '#30303f'; ctx.lineWidth = 4; ctx.strokeRect(2,2,W-4,H-4);
+  ctx.strokeStyle = '#30303f'; ctx.lineWidth = 4; ctx.strokeRect(2,2,world.w-4,world.h-4);
 
   // particles
   for (const p of particles) { ctx.globalAlpha = Math.max(0,p.life/p.maxLife); ctx.fillStyle = p.color; ctx.fillRect(p.x-p.r,p.y-p.r,p.r*2,p.r*2); }
@@ -662,7 +730,7 @@ function drawHUD() {
     ctx.font = 'bold 40px "Courier New", monospace'; ctx.fillStyle = '#ffe27a';
     ctx.fillText(state.roundBannerText, W/2, H/2 - 90);
     ctx.font = '16px "Courier New", monospace'; ctx.fillStyle = '#bcd';
-    ctx.fillText('next map: ' + (net.mapName || ''), W/2, H/2 - 50);
+    ctx.fillText(state.roundBannerSub || '', W/2, H/2 - 50);
     ctx.globalAlpha = 1;
   }
 
@@ -673,7 +741,10 @@ function drawHUD() {
   board.sort((a,b) => b.score - a.score);
   ctx.textAlign = 'right'; ctx.font = '13px "Courier New", monospace';
   let yy = 12;
-  ctx.fillStyle = '#778'; ctx.fillText(`ROOM ${net.room} · ${board.length} players`, W-16, yy); yy += 20;
+  const roomLabel = net.code
+    ? `PRIVATE ${net.code} · ${net.mode.toUpperCase()} · ${board.length}`
+    : `${net.mode.toUpperCase()} · ${board.length} players`;
+  ctx.fillStyle = net.code ? '#fc6' : '#778'; ctx.fillText(roomLabel, W-16, yy); yy += 20;
   for (const e of board.slice(0, 8)) {
     ctx.fillStyle = e.me ? '#8fd0ff' : '#bcd';
     ctx.fillText(`${e.name}  ${e.score}`, W-16, yy); yy += 17;
@@ -765,6 +836,7 @@ function loop(now) {
       simAcc -= FIXED_DT; steps++; stepped++;
     }
     if (steps >= 8) simAcc = 0;      // avoid spiral of death after a long stall
+    updateCamera();
     updateRemotes(frame);
     maybeSendState(now);
   }
@@ -782,20 +854,48 @@ requestAnimationFrame(loop);
 const joinEl = document.getElementById('join');
 const nameEl = document.getElementById('name');
 const playBtn = document.getElementById('play');
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const codeEl = document.getElementById('code');
+const modeHint = document.getElementById('modehint');
+let selectedMode = 'mini';
+
+const MODE_HINTS = {
+  mini: 'single-screen arena — the whole map is visible at once',
+  maxi: 'big scrolling world — the view follows you, fits more players',
+};
+document.querySelectorAll('.modebtn').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.modebtn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    selectedMode = b.dataset.mode;
+    modeHint.textContent = MODE_HINTS[selectedMode];
+  });
+});
+
 function setStatus(s) { document.getElementById('status').textContent = s; }
 function hideJoin() { joinEl.style.display = 'none'; canvas.focus(); }
-function startGame() {
+function playerName() { return (nameEl.value || 'Player').trim().slice(0, 14) || 'Player'; }
+
+function startGame(extra) {
   // Common mistake: opening index.html as a file. There's no server to reach.
   if (location.protocol === 'file:') {
     setStatus('Don’t open the file directly. Run "node server.js", then visit http://localhost:3000');
     return;
   }
-  const name = (nameEl.value || 'Player').trim().slice(0, 14) || 'Player';
   setStatus('connecting…');
-  connect(name);
+  connect(Object.assign({ name: playerName(), mode: selectedMode }, extra || {}));
 }
-playBtn.addEventListener('click', startGame);
+
+playBtn.addEventListener('click', () => startGame());
+createBtn.addEventListener('click', () => startGame({ create: true }));
+joinBtn.addEventListener('click', () => {
+  const code = (codeEl.value || '').trim().toUpperCase();
+  if (code.length < 3) { setStatus('enter the 4-letter game code your friend shared'); return; }
+  startGame({ code });
+});
 nameEl.addEventListener('keydown', e => { if (e.key === 'Enter') startGame(); });
+codeEl.addEventListener('keydown', e => { if (e.key === 'Enter') joinBtn.click(); });
 nameEl.focus();
 </script>
 </body>
