@@ -34,9 +34,9 @@ const PORT          = process.env.PORT || 3000;
 const MAX_PLAYERS   = 12;      // hard cap per room ("server"); preferred fill is 4-12
 const MIN_PLAYERS   = 2;       // a room stays in "warmup" (clock frozen, no map rotation)
                                // until at least this many players are present
-const SNAPSHOT_HZ   = 20;      // state broadcasts per second
+const SNAPSHOT_HZ   = 30;      // state broadcasts per second (higher = fresher remote positions)
 const TICK_HZ       = 30;      // server logic ticks (respawns, round timer)
-const ROUND_TIME    = 150;     // seconds per map before rotating
+const ROUND_TIME    = 180;     // seconds per round (3 minutes) before rotating
 const RESPAWN_TIME  = 2000;    // ms dead before respawn
 const SPAWN_PROTECT = 1500;    // ms of invulnerability after spawning
 const DMG = { melee: 50, ranged: 25, saber: 1000 };
@@ -339,6 +339,11 @@ setInterval(() => {
 
     // map rotation
     if (now >= room.roundEndsAt) {
+      // decide the winner of the round that just ended (before scores reset)
+      let winner = null, best = -1;
+      for (const p of room.players.values()) {
+        if (p.score > best) { best = p.score; winner = p; }
+      }
       room.mapIndex = (room.mapIndex + 1) % MAPS.length;
       room.roundEndsAt = now + ROUND_TIME * 1000;
       for (const p of room.players.values()) {
@@ -350,6 +355,8 @@ setInterval(() => {
         t: 'mapChange',
         map: clientMap(room), mapIndex: room.mapIndex, mapName: MAPS[room.mapIndex].name,
         roundEndsAt: room.roundEndsAt,
+        winnerName: best > 0 && winner ? winner.name : null,
+        winnerScore: best > 0 ? best : 0,
       });
       // tell each client where it now spawns
       for (const p of room.players.values()) send(p.conn, { t: 'respawn', x: p.x, y: p.y });

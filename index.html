@@ -65,7 +65,7 @@ const TUNE = {
   // friction = fraction of velocity retained per second, applied pow(f, dt)
   GROUND_FRICTION: 0.00008, AIR_FRICTION: 0.04, SLIDE_FRICTION: 0.18,
 
-  MOVE_ACCEL: 4200, AIR_ACCEL: 2600, MAX_RUN_SPEED: 430,
+  MOVE_ACCEL: 5200, AIR_ACCEL: 3300, MAX_RUN_SPEED: 430,
   GRAVITY: 2600, MAX_FALL_SPEED: 1500,
 
   JUMP_FORCE: 850, DOUBLE_JUMP_FORCE: 760, JUMP_CUT: 0.45,
@@ -85,8 +85,10 @@ const TUNE = {
   SABER_KILL_COUNT: 5, SABER_KILL_WINDOW: 6.0, SABER_DURATION: 8.0,
   SABER_LENGTH: 170, SABER_WIDTH: 22, SABER_HIT_CD: 0.12,
 
-  NET_SEND_HZ: 22,            // how often we stream our state
-  REMOTE_LERP: 0.30,          // smoothing toward remote players' latest snapshot
+  NET_SEND_HZ: 30,            // how often we stream our state
+  REMOTE_SMOOTH: 0.05,        // time-constant (s) for smoothing remote players toward target
+  REMOTE_EXTRAP: 0.12,        // max seconds to extrapolate a remote player by its velocity
+  REMOTE_SNAP_DIST: 300,      // if a remote jumps further than this (respawn/teleport), snap instead of slide
 };
 
 const canvas = document.getElementById('game');
@@ -131,6 +133,10 @@ function onServerMessage(m) {
     case 'mapChange':
       loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
       bullets.length = 0; fx.length = 0;
+      state.roundBannerText = m.winnerName
+        ? `ROUND OVER — ${m.winnerName} wins (${m.winnerScore})`
+        : 'ROUND OVER';
+      state.roundBannerUntil = performance.now() + 4500;
       break;
     case 'respawn':
       player.x = m.x; player.y = m.y; player.vx = player.vy = 0;
@@ -149,8 +155,8 @@ function onServerMessage(m) {
         }
         let r = net.others.get(ps.id);
         if (!r) { r = { x: ps.x, y: ps.y }; net.others.set(ps.id, r); }
-        // store target; we lerp toward it each frame
-        r.tx = ps.x; r.ty = ps.y; r.vx = ps.vx; r.vy = ps.vy;
+        // store target + velocity + arrival time; we extrapolate & smooth toward it each frame
+        r.tx = ps.x; r.ty = ps.y; r.vx = ps.vx; r.vy = ps.vy; r.snapAt = performance.now();
         r.name = ps.n; r.facing = ps.f; r.aim = ps.a; r.hp = ps.hp;
         r.dead = ps.d; r.score = ps.s; r.sliding = ps.sl; r.wallrun = ps.wr;
         r.saber = ps.sb; r.invuln = ps.iv;
@@ -230,6 +236,7 @@ const player = {
 const state = {
   time: 0, shake: 0, flash: 0,
   killTimes: [], saberTimer: 0, lastSaberHit: {},
+  roundBannerText: '', roundBannerUntil: 0,
 };
 
 let bullets = [];       // local, real (do hit detection)
@@ -445,6 +452,24 @@ function updateBullets(dt) {
   rbullets = rbullets.filter(b => b.life > 0);
 }
 
+/* ---------------------------- Remote player smoothing ----------------------------
+   Each snapshot gives us a remote player's position + velocity. Between snapshots we
+   extrapolate along that velocity (so they keep moving instead of freezing at the last
+   packet) and ease the rendered position toward that predicted point with a
+   frame-rate-independent smoothing factor. This hides most of the network latency. */
+function updateRemotes(dt) {
+  const now = performance.now();
+  const k = 1 - Math.exp(-dt / TUNE.REMOTE_SMOOTH);   // 0..1, framerate-independent
+  for (const r of net.others.values()) {
+    if (r.x === undefined || r.tx === undefined) continue;
+    const ext = Math.min((now - (r.snapAt || now)) / 1000, TUNE.REMOTE_EXTRAP);
+    const px = r.tx + r.vx * ext;
+    const py = r.ty + r.vy * ext;
+    if (Math.hypot(px - r.x, py - r.y) > TUNE.REMOTE_SNAP_DIST) { r.x = px; r.y = py; }
+    else { r.x += (px - r.x) * k; r.y += (py - r.y) * k; }
+  }
+}
+
 /* ---------------------------- Lightsaber (local) ---------------------------- */
 function distPointSeg(px, py, ax, ay, bx, by) {
   const dx = bx-ax, dy = by-ay, l2 = dx*dx+dy*dy;
@@ -536,12 +561,9 @@ function render() {
     ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(b.x-b.vx*0.02,b.y-b.vy*0.02); ctx.stroke();
   }
 
-  // remote players
+  // remote players (positions are advanced in updateRemotes)
   for (const r of net.others.values()) {
     if (r.x === undefined) continue;
-    // smooth toward latest snapshot
-    r.x += (r.tx - r.x) * TUNE.REMOTE_LERP;
-    r.y += (r.ty - r.y) * TUNE.REMOTE_LERP;
     if (!r.dead) drawCharacter(r.x, r.y, r.facing, r.aim, '#ff8f6b', r.name, r.hp, r.saber, r.sliding, r.invuln, false);
   }
 
@@ -633,6 +655,17 @@ function drawHUD() {
     ctx.fillText(`${Math.floor(remain/60)}:${String(remain%60).padStart(2,'0')}`, W/2, 32);
   }
 
+  // round-over banner (center screen, fades out)
+  const bannerLeft = state.roundBannerUntil - performance.now();
+  if (bannerLeft > 0) {
+    ctx.globalAlpha = Math.min(1, bannerLeft / 800);
+    ctx.font = 'bold 40px "Courier New", monospace'; ctx.fillStyle = '#ffe27a';
+    ctx.fillText(state.roundBannerText, W/2, H/2 - 90);
+    ctx.font = '16px "Courier New", monospace'; ctx.fillStyle = '#bcd';
+    ctx.fillText('next map: ' + (net.mapName || ''), W/2, H/2 - 50);
+    ctx.globalAlpha = 1;
+  }
+
   // scoreboard (top right) — all players sorted by score
   const board = [];
   if (net.me) board.push({ name: 'YOU', score: net.me.s, me: true });
@@ -707,24 +740,40 @@ function maybeSendState(now) {
   });
 }
 
-/* ---------------------------- Main loop ---------------------------- */
+/* ---------------------------- Main loop ----------------------------
+   The local simulation runs on a FIXED timestep (accumulator pattern) so movement
+   physics are identical regardless of the display's refresh rate — no jitter at high
+   frame rates, no sluggishness at low ones. Visual-only work (remote smoothing,
+   particles, rendering) runs once per real frame. */
+const FIXED_DT = 1/120;
 let lastT = performance.now();
+let simAcc = 0;
 function loop(now) {
-  let dt = (now - lastT)/1000; lastT = now;
-  if (dt > 0.05) dt = 0.05;
+  let frame = (now - lastT)/1000; lastT = now;
+  if (frame > 0.05) frame = 0.05;   // clamp huge hitches (tab refocus etc.)
 
+  let stepped = 0;
   if (net.connected && net.map) {
-    state.time += dt;
-    updatePlayer(dt);
-    updateSaber(dt);
-    updateBullets(dt);
-    if (melee) { melee.timer -= dt; if (melee.timer <= 0) melee = null; }
+    simAcc += frame;
+    let steps = 0;
+    while (simAcc >= FIXED_DT && steps < 8) {
+      state.time += FIXED_DT;
+      updatePlayer(FIXED_DT);
+      updateSaber(FIXED_DT);
+      updateBullets(FIXED_DT);
+      if (melee) { melee.timer -= FIXED_DT; if (melee.timer <= 0) melee = null; }
+      simAcc -= FIXED_DT; steps++; stepped++;
+    }
+    if (steps >= 8) simAcc = 0;      // avoid spiral of death after a long stall
+    updateRemotes(frame);
     maybeSendState(now);
   }
-  updateParticles(dt);
+  updateParticles(frame);
   render();
 
-  keysPressedThisFrame = {};
+  // only clear edge-triggered inputs once a sim step has had a chance to consume them,
+  // so taps aren't dropped on frames where no fixed step ran (very high refresh rates)
+  if (stepped > 0 || !net.connected || !net.map) keysPressedThisFrame = {};
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
