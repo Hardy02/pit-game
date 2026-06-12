@@ -1,0 +1,10 @@
+.git
+.gitignore
+.claude
+*.bat
+*.log
+*.out
+*.err
+README.md
+Dockerfile
+.dockerignore

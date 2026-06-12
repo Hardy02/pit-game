@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PIT</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0d0d12;
+    height: 100%;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+  }
+  #wrap {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    background: #14141c;
+    box-shadow: 0 0 40px rgba(0,0,0,0.6);
+    image-rendering: pixelated;
+    cursor: crosshair;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1200" height="800"></canvas>
+</div>
+<script>
+"use strict";
+
+/* ============================================================================
+   PIT — single-file canvas action game
+   Side-view, INFINITELY scrolling arena. Momentum movement, chainable
+   traversal, melee + ranged, escalating enemies that path around walls,
+   variety-based style combo, and a 5-kill LIGHTSABER power-up.
+
+   ----------------------------------------------------------------------------
+   TUNING CONSTANTS — tweak everything here. All speeds px/sec, accel px/sec^2,
+   times in seconds. Movement is delta-time driven (frame-rate independent).
+   ============================================================================ */
+const TUNE = {
+  // --- Viewport ---
+  VIEW_W: 1200,
+  VIEW_H: 800,
+
+  // --- Friction (fraction of velocity RETAINED PER SECOND, applied pow(f,dt)) ---
+  GROUND_FRICTION: 0.00008,    // grippy stop when no input
+  AIR_FRICTION:    0.04,       // light horizontal drag in air
+  SLIDE_FRICTION:  0.18,       // slides glide far before stopping
+
+  // --- Player core movement ---
+  MOVE_ACCEL:      4200,
+  AIR_ACCEL:       2600,
+  MAX_RUN_SPEED:   430,        // soft cap for normal running (boosts can exceed)
+  GRAVITY:         2600,
+  MAX_FALL_SPEED:  1500,
+
+  // --- Jump ---
+  JUMP_FORCE:        850,
+  DOUBLE_JUMP_FORCE: 760,
+  JUMP_CUT:          0.45,     // release jump early -> shorter hop
+  COYOTE_TIME:       0.10,
+  JUMP_BUFFER:       0.12,
+
+  // --- Slide ---
+  SLIDE_SPEED:       620,
+  SLIDE_DURATION:    0.42,
+  SLIDE_HEIGHT_MULT: 0.5,
+
+  // --- Wall run ---
+  WALLRUN_DURATION:    0.55,
+  WALLRUN_GRAVITY:     260,
+  WALLRUN_SPEED_BOOST: 240,
+  WALLRUN_VMAX:        520,
+  WALLJUMP_X:          620,
+  WALLJUMP_Y:          780,
+  WALL_STICK_RANGE:    14,
+
+  // --- Combat ---
+  MELEE_RANGE:     78,
+  MELEE_ARC:       1.7,
+  MELEE_DURATION:  0.12,
+  MELEE_COOLDOWN:  0.16,
+  RANGED_COOLDOWN: 0.5,
+  BULLET_SPEED:    1050,
+  BULLET_LIFETIME: 1.4,
+  BULLET_RADIUS:   5,
+
+  SCORE_MELEE_KILL:  150,
+  SCORE_RANGED_KILL: 70,
+
+  // --- Player health ---
+  MAX_HP:       4,
+  HIT_IFRAMES:  0.9,
+  PLAYER_W:     26,
+  PLAYER_H:     52,
+
+  // --- Enemies ---
+  ENEMY_BASE_SPEED:    90,
+  ENEMY_SPEED_GROWTH:  7,      // +px/sec per minute survived
+  ENEMY_RADIUS:        16,
+  ENEMY_ACCEL:         900,
+  ENEMY_TOUCH_DMG_CD:  0.6,
+  ENEMY_AVOID_RANGE:   85,     // how far out enemies "feel" walls to steer around them
+  ENEMY_AVOID_STRENGTH: 2.8,   // how hard they bend their path around walls
+
+  // --- Spawning / escalation ---
+  SPAWN_INTERVAL_START: 1.5,
+  SPAWN_INTERVAL_MIN:   0.28,
+  SPAWN_TIME_RAMP:      0.012,
+  AGGRO_RAMP:           0.10,  // killing fast ramps difficulty UP
+  AGGRO_DECAY:          0.06,
+  MAX_ENEMIES:          90,
+  ENEMY_CULL_DIST:      2200,  // despawn enemies this far from player (infinite world)
+
+  // --- Combo / style ---
+  COMBO_WINDOW:   2.2,
+  COMBO_MAX_MULT: 8,
+
+  // --- LIGHTSABER power-up ---
+  SABER_KILL_COUNT:  5,        // kills required...
+  SABER_KILL_WINDOW: 3.5,      // ...within this many seconds to earn the saber
+  SABER_DURATION:    5.0,      // saber lasts this long
+  SABER_LENGTH:      165,      // blade reach from player center
+  SABER_WIDTH:       22,       // blade thickness (kill radius)
+
+  // --- Infinite world generation ---
+  CHUNK_W:           540,      // width of a procedural terrain chunk
+  CHUNK_LOAD_RADIUS: 3,        // chunks kept loaded each side of the player
+  CAM_SMOOTH:        9,        // camera follow stiffness (higher = snappier)
+};
+
+/* Tracked action types feeding the variety-combo. Repeating the SAME action
+   does not build combo; switching to a DIFFERENT one does. */
+const ACT = { JUMP:'JUMP', DOUBLEJUMP:'DJUMP', SLIDE:'SLIDE', WALLRUN:'WALL', WALLJUMP:'WJUMP', MELEE:'MELEE', RANGED:'RANGED', KILL:'KILL' };
+
+/* ============================================================================
+   Setup
+   ============================================================================ */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = TUNE.VIEW_W, H = TUNE.VIEW_H;
+const GROUND_Y = H - 40;      // top of the ground floor (fixed world Y; world scrolls only on X)
+const START_X = 0;            // player spawn X in world space
+
+function fit() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', fit);
+fit();
+
+/* ---- Input ----
+   Controls: A/D (or arrows) move. W (or Space) jump. S or Shift slide.
+   Left click melee, right click ranged. Enter restarts on death. */
+const keys = {};
+const mouse = { x: W/2, y: H/2, left:false, right:false };
+
+window.addEventListener('keydown', e => {
+  if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+  const k = e.key.toLowerCase();
+  const isEdge = !keys[k];                  // true only on the initial press (ignore auto-repeat)
+  if (isEdge) keysPressedThisFrame[k] = true;
+  keys[k] = true;
+  // Jump on W or Space — edge only so holding the key can't auto-trigger a double jump.
+  if (isEdge && (k === 'w' || k === ' ')) jumpBufferTimer = TUNE.JUMP_BUFFER;
+  if (k === 'enter' && state.dead) restart();
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+function mousePos(e) {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) / r.width  * W;
+  mouse.y = (e.clientY - r.top)  / r.height * H;
+}
+canvas.addEventListener('mousemove', mousePos);
+canvas.addEventListener('mousedown', e => {
+  mousePos(e);
+  if (e.button === 0) { mouse.left = true; queueMelee = true; }
+  if (e.button === 2) { mouse.right = true; queueRanged = true; }
+});
+window.addEventListener('mouseup', e => {
+  if (e.button === 0) mouse.left = false;
+  if (e.button === 2) mouse.right = false;
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+let keysPressedThisFrame = {};
+let jumpBufferTimer = 0;
+let queueMelee = false;
+let queueRanged = false;
+
+/* ============================================================================
+   Camera — follows the player; the world scrolls horizontally forever.
+   World coords are converted to screen by translating -cam.x in render().
+   ============================================================================ */
+const cam = { x: START_X - W/2, y: 0 };
+
+// Mouse aim is computed in WORLD space (screen mouse + camera offset).
+function aimAngle() {
+  return Math.atan2(mouse.y - (player.y + player.h/2), (mouse.x + cam.x) - player.x);
+}
+
+/* ============================================================================
+   Infinite procedural terrain
+   The world is divided into fixed-width chunks. Each chunk's obstacles are
+   generated deterministically from its index (seeded RNG) so terrain is stable
+   if you backtrack. Only chunks near the player are kept in the active list.
+   ============================================================================ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+const chunkCache = new Map();        // chunkIndex -> [obstacle rects]
+let obstacles = [];                  // flattened active obstacles near the player
+let loadedRange = { min: null, max: null };
+
+// Generate the obstacles for one chunk. Mix of ground blocks (great for
+// wall-running), floating platforms, and pillars — varied each chunk.
+function genChunk(ci) {
+  const rng = mulberry32((ci * 2654435761) >>> 0 ^ 0x9e3779b9);
+  const baseX = ci * TUNE.CHUNK_W;
+  const obs = [];
+  const count = 2 + Math.floor(rng() * 3);   // 2–4 features per chunk
+  for (let i = 0; i < count; i++) {
+    const roll = rng();
+    const x = baseX + 60 + rng() * (TUNE.CHUNK_W - 200);
+    let rect;
+    if (roll < 0.42) {
+      // ground block (wall-run + slide-over surfaces)
+      const w = 80 + rng() * 130;
+      const h = 130 + rng() * 200;
+      rect = { x, y: GROUND_Y - h, w, h };
+    } else if (roll < 0.74) {
+      // floating platform
+      const w = 120 + rng() * 170;
+      const y = 250 + rng() * 300;
+      rect = { x, y, w, h: 38 };
+    } else {
+      // tall pillar (wall-run column)
+      const w = 48 + rng() * 34;
+      const h = 130 + rng() * 180;
+      const y = 180 + rng() * 220;
+      rect = { x, y, w, h };
+    }
+    // keep the spawn area clear so the player never starts inside a block
+    if (rect.x < START_X + 130 && rect.x + rect.w > START_X - 130) continue;
+    obs.push(rect);
+  }
+  return obs;
+}
+
+// Rebuild the active obstacle list when the player crosses into new chunks.
+function updateChunks() {
+  const ci = Math.floor(player.x / TUNE.CHUNK_W);
+  const min = ci - TUNE.CHUNK_LOAD_RADIUS;
+  const max = ci + TUNE.CHUNK_LOAD_RADIUS;
+  if (loadedRange.min === min && loadedRange.max === max) return;
+  loadedRange.min = min; loadedRange.max = max;
+  obstacles = [];
+  for (let c = min; c <= max; c++) {
+    if (!chunkCache.has(c)) chunkCache.set(c, genChunk(c));
+    for (const o of chunkCache.get(c)) obstacles.push(o);
+  }
+}
+
+/* ============================================================================
+   Game state
+   ============================================================================ */
+let state, player, enemies, bullets, particles, melee;
+
+function makePlayer() {
+  return {
+    x: START_X, y: GROUND_Y - TUNE.PLAYER_H,
+    vx: 0, vy: 0,
+    w: TUNE.PLAYER_W, h: TUNE.PLAYER_H,
+    facing: 1,
+    onGround: false,
+    jumpsUsed: 0,
+    coyoteTimer: 0,
+    sliding: false,
+    slideTimer: 0,
+    wallRunning: false,
+    wallSide: 0,
+    wallTimer: 0,
+    wallContact: 0,
+    hp: TUNE.MAX_HP,
+    iframes: 0,
+    meleeCooldown: 0,
+    rangedCooldown: 0,
+    trail: [],
+  };
+}
+
+function restart() {
+  state = {
+    time: 0,
+    score: 0,
+    dead: false,
+    spawnTimer: 0.5,
+    aggro: 0,
+    kills: 0,
+    combo: 1,
+    comboTimer: 0,
+    lastAction: null,
+    chainCount: 0,
+    flash: 0,
+    shake: 0,
+    killTimes: [],     // timestamps of recent kills (for saber trigger)
+    saberTimer: 0,     // >0 while the lightsaber is active
+  };
+  player = makePlayer();
+  enemies = [];
+  bullets = [];
+  particles = [];
+  melee = null;
+  queueMelee = queueRanged = false;
+  cam.x = START_X - W/2;
+  loadedRange.min = loadedRange.max = null;
+  updateChunks();
+}
+
+/* ============================================================================
+   Combo / style system — variety builds the multiplier, repetition does not.
+   ============================================================================ */
+function registerAction(actType, worldX, worldY) {
+  if (actType !== state.lastAction) {
+    state.chainCount++;
+    state.combo = Math.min(TUNE.COMBO_MAX_MULT, 1 + Math.floor(state.chainCount / 2));
+    state.comboTimer = TUNE.COMBO_WINDOW;
+    state.lastAction = actType;
+    if (state.combo >= 3) {
+      state.flash = Math.min(1, state.flash + 0.5);
+      spawnBurst(worldX ?? player.x, worldY ?? player.y, comboColor(), 6);
+    }
+  } else {
+    state.comboTimer = Math.max(state.comboTimer, TUNE.COMBO_WINDOW * 0.6);
+  }
+}
+
+function comboColor() {
+  const hue = (180 + state.combo * 22) % 360;
+  return `hsl(${hue}, 90%, 60%)`;
+}
+
+/* ============================================================================
+   Collision helpers
+   ============================================================================ */
+function playerRect() {
+  const h = player.sliding ? player.h * TUNE.SLIDE_HEIGHT_MULT : player.h;
+  return { x: player.x - player.w/2, y: player.y + (player.h - h), w: player.w, h: h };
+}
+
+function aabb(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Resolve collisions vs obstacles + an infinite ground strip. No side walls now.
+function collideWorld(dt) {
+  player.onGround = false;
+  let touchingWallSide = 0;
+
+  // ground spans a wide band around the player (world is infinite horizontally)
+  const ground = { x: player.x - 4000, y: GROUND_Y, w: 8000, h: H - GROUND_Y };
+  const solids = obstacles.concat([ground]);
+
+  const r = playerRect();
+
+  // --- Horizontal pass ---
+  let nx = r.x + player.vx * dt;
+  let nxRect = { x: nx, y: r.y, w: r.w, h: r.h };
+  for (const s of solids) {
+    if (aabb(nxRect, s)) {
+      if (player.vx > 0) { nx = s.x - r.w; touchingWallSide = 1; }
+      else if (player.vx < 0) { nx = s.x + s.w; touchingWallSide = -1; }
+      player.vx = 0;
+      nxRect.x = nx;
+    }
+  }
+  player.x = nx + r.w/2;
+
+  // --- Vertical pass ---
+  const r2 = playerRect();
+  let ny = r2.y + player.vy * dt;
+  let nyRect = { x: r2.x, y: ny, w: r2.w, h: r2.h };
+  for (const s of solids) {
+    if (aabb(nyRect, s)) {
+      if (player.vy > 0) { ny = s.y - r2.h; player.onGround = true; player.vy = 0; }
+      else if (player.vy < 0) { ny = s.y + s.h; player.vy = 0; }
+      nyRect.y = ny;
+    }
+  }
+  if (ny < 0) { ny = 0; player.vy = 0; }   // soft ceiling at top of viewport
+  player.y = ny - (player.h - r2.h);
+
+  player.wallContact = touchingWallSide;
+}
+
+// Is a wall right beside the player (within stick range) for a wall-run latch?
+function wallBeside() {
+  const r = playerRect();
+  const probeL = { x: r.x - TUNE.WALL_STICK_RANGE, y: r.y + 4, w: TUNE.WALL_STICK_RANGE, h: r.h - 8 };
+  const probeR = { x: r.x + r.w, y: r.y + 4, w: TUNE.WALL_STICK_RANGE, h: r.h - 8 };
+  let side = 0;
+  for (const s of obstacles) {
+    if (aabb(probeL, s)) side = -1;
+    if (aabb(probeR, s)) side =  1;
+  }
+  return side;
+}
+
+/* ============================================================================
+   Player update — movement is the heart of the game.
+   ============================================================================ */
+function updatePlayer(dt) {
+  const inputX = (keys['d'] || keys['arrowright'] ? 1 : 0) - (keys['a'] || keys['arrowleft'] ? 1 : 0);
+
+  player.meleeCooldown  = Math.max(0, player.meleeCooldown - dt);
+  player.rangedCooldown = Math.max(0, player.rangedCooldown - dt);
+  player.iframes        = Math.max(0, player.iframes - dt);
+  if (jumpBufferTimer > 0) jumpBufferTimer -= dt;
+
+  if (player.onGround) { player.coyoteTimer = TUNE.COYOTE_TIME; player.jumpsUsed = 0; }
+  else player.coyoteTimer = Math.max(0, player.coyoteTimer - dt);
+
+  /* ---------------- WALL RUN ---------------- */
+  const sideWall = wallBeside();
+  if (!player.onGround && !player.wallRunning && sideWall !== 0 && inputX === sideWall && player.wallTimer <= 0) {
+    player.wallRunning = true;
+    player.wallSide = sideWall;
+    player.wallTimer = TUNE.WALLRUN_DURATION;
+    player.vy = -TUNE.WALLRUN_SPEED_BOOST;
+    player.jumpsUsed = 0;
+    registerAction(ACT.WALLRUN, player.x, player.y);
+  }
+  if (player.wallRunning) {
+    player.wallTimer -= dt;
+    player.vy += TUNE.WALLRUN_GRAVITY * dt;
+    player.vy = Math.max(-TUNE.WALLRUN_VMAX, Math.min(player.vy, TUNE.MAX_FALL_SPEED));
+    player.vx = player.wallSide * 30;
+    player.facing = -player.wallSide;
+    if (player.wallTimer <= 0 || wallBeside() !== player.wallSide || inputX === -player.wallSide) {
+      player.wallRunning = false;
+      player.wallTimer = 0.05;
+    }
+    if (Math.random() < 0.5) spawnBurst(player.x + player.wallSide*player.w/2, player.y + Math.random()*player.h, '#5cf', 1, 80);
+  } else if (player.wallTimer > 0) {
+    player.wallTimer -= dt;
+  }
+
+  /* ---------------- SLIDE ---------------- */
+  if (player.sliding) {
+    player.slideTimer -= dt;
+    if (player.slideTimer <= 0 || (!player.onGround && !player.wallRunning && player.vy > 200)) {
+      player.sliding = false;
+    }
+  }
+  // start slide on S or Shift while there's some movement to slide with
+  const slidePressed = keysPressedThisFrame['s'] || keysPressedThisFrame['shift'];
+  if (slidePressed && !player.sliding && (Math.abs(player.vx) > 60 || inputX !== 0)) {
+    player.sliding = true;
+    player.slideTimer = TUNE.SLIDE_DURATION;
+    const dir = inputX !== 0 ? inputX : player.facing;
+    player.facing = dir;
+    player.vx += dir * TUNE.SLIDE_SPEED;   // burst that preserves existing momentum
+    registerAction(ACT.SLIDE, player.x, player.y);
+    spawnBurst(player.x, player.y + player.h, '#fc6', 8, 120);
+  }
+
+  /* ---------------- HORIZONTAL MOVEMENT ---------------- */
+  if (!player.wallRunning) {
+    if (inputX !== 0) player.facing = inputX;
+    const accel = player.onGround ? TUNE.MOVE_ACCEL : TUNE.AIR_ACCEL;
+    if (inputX !== 0 && !player.sliding) {
+      player.vx += inputX * accel * dt;
+      if (Math.abs(player.vx) > TUNE.MAX_RUN_SPEED && Math.sign(player.vx) === inputX) {
+        player.vx -= inputX * accel * dt;  // don't accelerate past the soft cap
+        player.vx = Math.sign(player.vx) * Math.max(TUNE.MAX_RUN_SPEED, Math.abs(player.vx) - 200*dt);
+      }
+    }
+    // friction (frame-rate independent, "retained fraction per second")
+    if (player.sliding) {
+      player.vx *= Math.pow(TUNE.SLIDE_FRICTION, dt);
+    } else if (player.onGround) {
+      if (inputX === 0) player.vx *= Math.pow(TUNE.GROUND_FRICTION, dt);
+    } else {
+      if (inputX === 0) player.vx *= Math.pow(TUNE.AIR_FRICTION, dt);
+    }
+  }
+
+  /* ---------------- GRAVITY ---------------- */
+  if (!player.wallRunning) {
+    player.vy += TUNE.GRAVITY * dt;
+    if (player.vy > TUNE.MAX_FALL_SPEED) player.vy = TUNE.MAX_FALL_SPEED;
+  }
+
+  /* ---------------- JUMP / DOUBLE / WALL JUMP ---------------- */
+  if (jumpBufferTimer > 0) {
+    if (player.wallRunning) {
+      player.vy = -TUNE.WALLJUMP_Y;
+      player.vx = -player.wallSide * TUNE.WALLJUMP_X;
+      player.wallRunning = false;
+      player.wallTimer = 0.05;
+      player.jumpsUsed = 1;
+      jumpBufferTimer = 0;
+      registerAction(ACT.WALLJUMP, player.x, player.y);
+      spawnBurst(player.x + player.wallSide*player.w/2, player.y + player.h/2, '#9cf', 10, 180);
+    } else if (player.onGround || player.coyoteTimer > 0) {
+      player.vy = -TUNE.JUMP_FORCE;
+      player.jumpsUsed = 1;
+      player.onGround = false;
+      player.coyoteTimer = 0;
+      player.sliding = false;            // slide -> jump chain
+      jumpBufferTimer = 0;
+      registerAction(ACT.JUMP, player.x, player.y);
+    } else if (player.jumpsUsed < 2) {
+      player.vy = -TUNE.DOUBLE_JUMP_FORCE;
+      player.jumpsUsed = 2;
+      jumpBufferTimer = 0;
+      registerAction(ACT.DOUBLEJUMP, player.x, player.y);
+      spawnBurst(player.x, player.y + player.h, '#8df', 8, 140);
+    }
+  }
+  // variable jump height: release jump key early to cut the rise
+  if (!keys[' '] && !keys['w'] && player.vy < 0 && !player.wallRunning) {
+    player.vy *= Math.pow(TUNE.JUMP_CUT, dt*30);
+  }
+
+  /* ---------------- COMBAT ---------------- */
+  if (queueMelee && player.meleeCooldown <= 0) { doMelee(); player.meleeCooldown = TUNE.MELEE_COOLDOWN; }
+  queueMelee = false;
+  if (queueRanged && player.rangedCooldown <= 0) { doRanged(); player.rangedCooldown = TUNE.RANGED_COOLDOWN; }
+  queueRanged = false;
+
+  /* ---------------- INTEGRATE + COLLIDE ---------------- */
+  collideWorld(dt);
+  if (player.onGround && player.wallRunning) player.wallRunning = false;
+
+  // trail for high-combo visual
+  player.trail.push({ x: player.x, y: player.y + player.h/2 });
+  if (player.trail.length > 18) player.trail.shift();
+
+  // combo decay
+  if (state.comboTimer > 0) {
+    state.comboTimer -= dt;
+    if (state.comboTimer <= 0) { state.combo = 1; state.chainCount = 0; state.lastAction = null; }
+  }
+  state.flash = Math.max(0, state.flash - dt * 2.5);
+  state.shake = Math.max(0, state.shake - dt * 40);
+}
+
+/* ============================================================================
+   Combat actions
+   ============================================================================ */
+function doMelee() {
+  const ang = aimAngle();
+  melee = { ang, timer: TUNE.MELEE_DURATION, x: player.x, y: player.y + player.h/2 };
+  registerAction(ACT.MELEE, player.x, player.y);
+  for (const e of enemies) {
+    if (e.dead) continue;
+    const dx = e.x - melee.x, dy = e.y - melee.y;
+    if (Math.hypot(dx, dy) > TUNE.MELEE_RANGE + e.r) continue;
+    let da = Math.atan2(dy, dx) - ang;
+    while (da > Math.PI) da -= Math.PI*2;
+    while (da < -Math.PI) da += Math.PI*2;
+    if (Math.abs(da) <= TUNE.MELEE_ARC/2) killEnemy(e, true, ang);
+  }
+  state.shake = Math.max(state.shake, 4);
+}
+
+function doRanged() {
+  const ang = aimAngle();
+  bullets.push({
+    x: player.x, y: player.y + player.h/2,
+    vx: Math.cos(ang) * TUNE.BULLET_SPEED,
+    vy: Math.sin(ang) * TUNE.BULLET_SPEED,
+    life: TUNE.BULLET_LIFETIME,
+  });
+  registerAction(ACT.RANGED, player.x, player.y);
+  player.vx -= Math.cos(ang) * 40;   // slight recoil
+  player.vy -= Math.sin(ang) * 25;
+  spawnBurst(player.x + Math.cos(ang)*20, player.y + player.h/2 + Math.sin(ang)*20, '#fe7', 3, 200);
+}
+
+function killEnemy(e, meleeKill, ang) {
+  if (e.dead) return;
+  e.dead = true;
+  state.kills++;
+  state.aggro += TUNE.AGGRO_RAMP;
+  registerAction(ACT.KILL, e.x, e.y);
+  const base = meleeKill ? TUNE.SCORE_MELEE_KILL : TUNE.SCORE_RANGED_KILL;
+  state.score += Math.round(base * state.combo);
+  spawnBurst(e.x, e.y, meleeKill ? '#f86' : '#fd6', 12, 240);
+  state.flash = Math.min(1, state.flash + 0.25);
+  state.shake = Math.max(state.shake, meleeKill ? 6 : 3);
+
+  // --- Lightsaber trigger: N kills within the window earns the saber ---
+  state.killTimes.push(state.time);
+  state.killTimes = state.killTimes.filter(t => state.time - t <= TUNE.SABER_KILL_WINDOW);
+  if (state.killTimes.length >= TUNE.SABER_KILL_COUNT) {
+    state.saberTimer = TUNE.SABER_DURATION;
+    state.killTimes = [];
+    state.flash = 1;
+    state.shake = Math.max(state.shake, 14);
+    spawnBurst(player.x, player.y + player.h/2, '#5f5', 26, 320);
+  }
+}
+
+/* ============================================================================
+   Lightsaber — while active, a blade extends toward the cursor and instantly
+   destroys anything it touches.
+   ============================================================================ */
+function distPointSeg(px, py, ax, ay, bx, by) {
+  const dx = bx-ax, dy = by-ay;
+  const l2 = dx*dx + dy*dy;
+  let t = l2 ? ((px-ax)*dx + (py-ay)*dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t*dx, cy = ay + t*dy;
+  return Math.hypot(px-cx, py-cy);
+}
+
+function updateSaber(dt) {
+  if (state.saberTimer <= 0) return;
+  state.saberTimer -= dt;
+  const ang = aimAngle();
+  const ax = player.x, ay = player.y + player.h/2;
+  const bx = ax + Math.cos(ang) * TUNE.SABER_LENGTH;
+  const by = ay + Math.sin(ang) * TUNE.SABER_LENGTH;
+  for (const e of enemies) {
+    if (e.dead) continue;
+    if (distPointSeg(e.x, e.y, ax, ay, bx, by) < e.r + TUNE.SABER_WIDTH/2) {
+      killEnemy(e, true, ang);   // saber kills count as melee (max score)
+    }
+  }
+}
+
+/* ============================================================================
+   Enemies — steer toward the player but avoid/collide with walls.
+   ============================================================================ */
+function currentEnemySpeed() {
+  const minutes = state.time / 60;
+  return TUNE.ENEMY_BASE_SPEED + TUNE.ENEMY_SPEED_GROWTH * minutes * (1 + state.aggro);
+}
+
+function spawnInterval() {
+  let iv = TUNE.SPAWN_INTERVAL_START - state.time * TUNE.SPAWN_TIME_RAMP - state.aggro * 0.15;
+  return Math.max(TUNE.SPAWN_INTERVAL_MIN, iv);
+}
+
+// Spawn just off the visible screen edges (which move with the camera).
+function spawnEnemy() {
+  if (enemies.length >= TUNE.MAX_ENEMIES) return;
+  const edge = Math.floor(Math.random()*3); // 0 left, 1 right, 2 top
+  let x, y;
+  if (edge === 0)      { x = cam.x - 30;        y = 80 + Math.random()*(GROUND_Y-160); }
+  else if (edge === 1) { x = cam.x + W + 30;    y = 80 + Math.random()*(GROUND_Y-160); }
+  else                 { x = cam.x + Math.random()*W; y = 10; }
+  enemies.push({
+    x, y, vx:0, vy:0, r: TUNE.ENEMY_RADIUS,
+    dead:false, hitCd:0,
+    hue: 350 + Math.random()*20,
+    spawnAnim: 0.3,
+  });
+}
+
+function updateEnemies(dt) {
+  state.spawnTimer -= dt;
+  if (state.spawnTimer <= 0) { spawnEnemy(); state.spawnTimer = spawnInterval(); }
+
+  const spd = currentEnemySpeed();
+  const px = player.x, py = player.y + player.h/2;
+
+  for (const e of enemies) {
+    if (e.dead) continue;
+    if (e.spawnAnim > 0) e.spawnAnim -= dt;
+    e.hitCd = Math.max(0, e.hitCd - dt);
+
+    // base steering toward the player
+    const dx = px - e.x, dy = py - e.y;
+    const d = Math.hypot(dx, dy) || 1;
+    let sx = dx/d, sy = dy/d;
+
+    // wall avoidance: push away from the nearest point of any close obstacle.
+    // Because enemies float, this bends their path up/over/around walls instead
+    // of letting them pass straight through.
+    for (const o of obstacles) {
+      const cx = Math.max(o.x, Math.min(e.x, o.x + o.w));
+      const cy = Math.max(o.y, Math.min(e.y, o.y + o.h));
+      const ox = e.x - cx, oy = e.y - cy;
+      const od = Math.hypot(ox, oy);
+      if (od < TUNE.ENEMY_AVOID_RANGE) {
+        const w = (TUNE.ENEMY_AVOID_RANGE - od) / TUNE.ENEMY_AVOID_RANGE;
+        if (od > 0.001) { sx += (ox/od) * w * TUNE.ENEMY_AVOID_STRENGTH; sy += (oy/od) * w * TUNE.ENEMY_AVOID_STRENGTH; }
+        else { sy -= 1; }   // dead-centre inside: nudge upward
+      }
+    }
+
+    // normalize steering and accelerate
+    const sl = Math.hypot(sx, sy) || 1;
+    e.vx += (sx/sl) * TUNE.ENEMY_ACCEL * dt;
+    e.vy += (sy/sl) * TUNE.ENEMY_ACCEL * dt;
+    const v = Math.hypot(e.vx, e.vy) || 1;
+    if (v > spd) { e.vx = e.vx/v*spd; e.vy = e.vy/v*spd; }
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+
+    // hard collision: never overlap an obstacle (push back out along nearest normal)
+    for (const o of obstacles) {
+      const cx = Math.max(o.x, Math.min(e.x, o.x + o.w));
+      const cy = Math.max(o.y, Math.min(e.y, o.y + o.h));
+      const ox = e.x - cx, oy = e.y - cy;
+      const od = Math.hypot(ox, oy);
+      if (od < e.r) {
+        if (od > 0.001) { e.x += (ox/od) * (e.r - od); e.y += (oy/od) * (e.r - od); }
+        else { e.y -= e.r; }
+      }
+    }
+
+    // soft separation so enemies don't fully stack
+    for (const o of enemies) {
+      if (o === e || o.dead) continue;
+      const ox = e.x - o.x, oy = e.y - o.y;
+      const od = Math.hypot(ox, oy);
+      if (od > 0 && od < e.r*2) {
+        const push = (e.r*2 - od) * 0.5;
+        e.x += (ox/od)*push; e.y += (oy/od)*push;
+      }
+    }
+
+    // touch damage
+    const pr = playerRect();
+    const closestX = Math.max(pr.x, Math.min(e.x, pr.x+pr.w));
+    const closestY = Math.max(pr.y, Math.min(e.y, pr.y+pr.h));
+    const cdx = e.x - closestX, cdy = e.y - closestY;
+    if (cdx*cdx + cdy*cdy < e.r*e.r) {
+      if (player.iframes <= 0 && e.hitCd <= 0) {
+        damagePlayer();
+        e.hitCd = TUNE.ENEMY_TOUCH_DMG_CD;
+        const kd = Math.hypot(cdx,cdy)||1;
+        e.vx = cdx/kd * 200; e.vy = cdy/kd * 200;
+      }
+    }
+  }
+
+  state.aggro = Math.max(0, state.aggro - TUNE.AGGRO_DECAY * dt);
+
+  // cull dead OR far-away enemies (world is infinite)
+  enemies = enemies.filter(e => !e.dead && Math.abs(e.x - player.x) < TUNE.ENEMY_CULL_DIST);
+}
+
+function damagePlayer() {
+  player.hp--;
+  player.iframes = TUNE.HIT_IFRAMES;
+  state.shake = Math.max(state.shake, 10);
+  state.flash = Math.min(1, state.flash + 0.4);
+  spawnBurst(player.x, player.y + player.h/2, '#f44', 16, 280);
+  state.combo = 1; state.chainCount = 0; state.lastAction = null; state.comboTimer = 0;
+  if (player.hp <= 0) state.dead = true;
+}
+
+/* ============================================================================
+   Bullets
+   ============================================================================ */
+function updateBullets(dt) {
+  for (const b of bullets) {
+    b.life -= dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.y < 0 || b.y > GROUND_Y) { b.life = 0; continue; }
+    let hitWall = false;
+    for (const s of obstacles) {
+      if (b.x > s.x && b.x < s.x+s.w && b.y > s.y && b.y < s.y+s.h) { hitWall = true; break; }
+    }
+    if (hitWall) { spawnBurst(b.x, b.y, '#fe7', 4, 200); b.life = 0; continue; }
+    for (const e of enemies) {
+      if (e.dead) continue;
+      const dx = e.x - b.x, dy = e.y - b.y;
+      if (dx*dx + dy*dy < (e.r + TUNE.BULLET_RADIUS)**2) { killEnemy(e, false, Math.atan2(b.vy, b.vx)); b.life = 0; break; }
+    }
+  }
+  bullets = bullets.filter(b => b.life > 0);
+}
+
+/* ============================================================================
+   Particles
+   ============================================================================ */
+function spawnBurst(x, y, color, count, speed = 200) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = speed * (0.3 + Math.random()*0.7);
+    particles.push({
+      x, y,
+      vx: Math.cos(a)*s, vy: Math.sin(a)*s - 40,
+      life: 0.3 + Math.random()*0.4, maxLife: 0.7,
+      color, r: 2 + Math.random()*2,
+    });
+  }
+}
+function updateParticles(dt) {
+  for (const p of particles) {
+    p.life -= dt;
+    p.vy += 600 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= Math.pow(0.001, dt);
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+/* ============================================================================
+   Rendering — world drawn under a camera translate; HUD drawn in screen space.
+   ============================================================================ */
+function render() {
+  // background (screen space)
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#14141c';
+  ctx.fillRect(0, 0, W, H);
+
+  // combo tint overlay
+  if (state.combo >= 3) {
+    ctx.fillStyle = comboColor();
+    ctx.globalAlpha = 0.04 + state.flash * 0.06;
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = 1;
+  }
+  // saber active tint
+  if (state.saberTimer > 0) {
+    ctx.fillStyle = '#3fa';
+    ctx.globalAlpha = 0.05;
+    ctx.fillRect(0,0,W,H);
+    ctx.globalAlpha = 1;
+  }
+
+  // --- world transform (camera + shake) ---
+  ctx.save();
+  let shx = 0, shy = 0;
+  if (state.shake > 0) { shx = (Math.random()-0.5)*state.shake; shy = (Math.random()-0.5)*state.shake; }
+  ctx.translate(shx - cam.x, shy);
+
+  // ground (draw across the visible band)
+  const gx = cam.x - 40, gw = W + 80;
+  ctx.fillStyle = '#23232f';
+  ctx.fillRect(gx, GROUND_Y, gw, H - GROUND_Y);
+  ctx.fillStyle = '#2d2d3d';
+  ctx.fillRect(gx, GROUND_Y, gw, 4);
+
+  // obstacles
+  for (const s of obstacles) {
+    ctx.fillStyle = '#262633';
+    ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.fillStyle = '#34344a';
+    ctx.fillRect(s.x, s.y, s.w, 4);          // top (run/land surface)
+    ctx.fillStyle = '#1c1c27';
+    ctx.fillRect(s.x, s.y, 3, s.h);          // left edge
+    ctx.fillRect(s.x+s.w-3, s.y, 3, s.h);    // right edge (wall-run surfaces)
+  }
+
+  // particles
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.r, p.y - p.r, p.r*2, p.r*2);
+  }
+  ctx.globalAlpha = 1;
+
+  // bullets
+  for (const b of bullets) {
+    ctx.fillStyle = '#ffe27a';
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, TUNE.BULLET_RADIUS, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,226,122,0.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - b.vx*0.02, b.y - b.vy*0.02);
+    ctx.stroke();
+  }
+
+  // enemies
+  for (const e of enemies) {
+    const grow = e.spawnAnim > 0 ? (1 - e.spawnAnim/0.3) : 1;
+    const r = e.r * grow;
+    ctx.fillStyle = `hsl(${e.hue}, 70%, 55%)`;
+    ctx.beginPath(); ctx.arc(e.x, e.y, r, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = `hsl(${e.hue}, 80%, 75%)`;
+    ctx.beginPath(); ctx.arc(e.x - r*0.25, e.y - r*0.25, r*0.4, 0, Math.PI*2); ctx.fill();
+  }
+
+  // high-combo trail
+  if (state.combo >= 3 && player.trail.length > 1) {
+    ctx.strokeStyle = comboColor();
+    ctx.lineWidth = 3;
+    ctx.globalAlpha = 0.35;
+    ctx.beginPath();
+    for (let i = 0; i < player.trail.length; i++) {
+      const t = player.trail[i];
+      if (i===0) ctx.moveTo(t.x, t.y); else ctx.lineTo(t.x, t.y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  drawPlayer();
+  drawSaber();
+
+  // melee swing arc
+  if (melee) {
+    const a = melee.timer / TUNE.MELEE_DURATION;
+    ctx.save();
+    ctx.translate(melee.x, melee.y);
+    ctx.rotate(melee.ang);
+    ctx.globalAlpha = a * 0.9;
+    ctx.fillStyle = state.combo >= 3 ? comboColor() : '#cfe8ff';
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.arc(0, 0, TUNE.MELEE_RANGE, -TUNE.MELEE_ARC/2, TUNE.MELEE_ARC/2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore(); // end world transform
+
+  drawHUD();
+  if (state.dead) drawDeath();
+}
+
+function drawPlayer() {
+  const px = player.x;
+  const r = playerRect();
+  const blink = player.iframes > 0 && Math.floor(player.iframes*20)%2===0;
+  if (blink) ctx.globalAlpha = 0.4;
+
+  const body = state.saberTimer > 0 ? '#bfffe0'
+             : (state.combo >= 3 ? comboColor() : '#e8ecff');
+  const halfW = player.w/2;
+  const top = r.y, bot = r.y + r.h;
+
+  ctx.fillStyle = body;
+  ctx.beginPath();
+  ctx.moveTo(px - halfW, top + halfW);
+  ctx.arc(px, top + halfW, halfW, Math.PI, 0);
+  ctx.lineTo(px + halfW, bot - halfW);
+  ctx.arc(px, bot - halfW, halfW, 0, Math.PI);
+  ctx.closePath();
+  ctx.fill();
+
+  // eye toward aim
+  const ang = aimAngle();
+  ctx.fillStyle = '#14141c';
+  const eyeY = top + halfW + 4;
+  ctx.beginPath();
+  ctx.arc(px + Math.cos(ang)*6, eyeY + Math.sin(ang)*4, 4, 0, Math.PI*2);
+  ctx.fill();
+
+  if (player.wallRunning) {
+    ctx.strokeStyle = '#5cf';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(px + player.wallSide*halfW, top);
+    ctx.lineTo(px + player.wallSide*halfW, bot);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // faint aim line (hidden while the saber is out — the blade shows aim instead)
+  if (state.saberTimer <= 0) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(px, player.y+player.h/2);
+    ctx.lineTo(px + Math.cos(ang)*60, player.y+player.h/2 + Math.sin(ang)*60);
+    ctx.stroke();
+  }
+}
+
+function drawSaber() {
+  if (state.saberTimer <= 0) return;
+  const ang = aimAngle();
+  const ax = player.x, ay = player.y + player.h/2;
+  const bx = ax + Math.cos(ang) * TUNE.SABER_LENGTH;
+  const by = ay + Math.sin(ang) * TUNE.SABER_LENGTH;
+  const hue = (state.time * 360) % 360;          // shimmering blade
+  ctx.lineCap = 'round';
+  // outer glow
+  ctx.strokeStyle = `hsla(${hue},100%,70%,0.25)`;
+  ctx.lineWidth = TUNE.SABER_WIDTH + 16;
+  ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  // mid
+  ctx.strokeStyle = `hsla(${hue},100%,65%,0.7)`;
+  ctx.lineWidth = TUNE.SABER_WIDTH;
+  ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  // hot white core
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = TUNE.SABER_WIDTH * 0.4;
+  ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  ctx.lineCap = 'butt';
+}
+
+function drawHUD() {
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.textBaseline = 'top';
+  ctx.font = '16px "Courier New", monospace';
+
+  // time + score (top-left)
+  const mins = Math.floor(state.time/60);
+  const secs = (state.time%60).toFixed(1).padStart(4,'0');
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#aab';
+  ctx.fillText(`TIME  ${mins}:${secs}`, 16, 14);
+  ctx.fillStyle = '#fff';
+  ctx.font = '22px "Courier New", monospace';
+  ctx.fillText(`${state.score}`, 16, 34);
+  ctx.font = '12px "Courier New", monospace';
+  ctx.fillStyle = '#778';
+  ctx.fillText('SCORE', 16, 60);
+
+  // combo (top-right)
+  ctx.textAlign = 'right';
+  if (state.combo > 1) {
+    const c = comboColor();
+    ctx.font = 'bold 30px "Courier New", monospace';
+    ctx.fillStyle = c;
+    ctx.fillText(`x${state.combo}`, W-16, 14);
+    const barW = 120;
+    const frac = Math.max(0, state.comboTimer / TUNE.COMBO_WINDOW);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.fillRect(W-16-barW, 52, barW, 6);
+    ctx.fillStyle = c;
+    ctx.fillRect(W-16-barW, 52, barW*frac, 6);
+    ctx.font = '11px "Courier New", monospace';
+    ctx.fillStyle = '#889';
+    ctx.fillText(`${state.chainCount} chained`, W-16, 64);
+  } else {
+    ctx.font = '13px "Courier New", monospace';
+    ctx.fillStyle = '#556';
+    ctx.fillText('chain actions for combo', W-16, 20);
+  }
+
+  // saber status (top-center)
+  if (state.saberTimer > 0) {
+    ctx.textAlign = 'center';
+    const hue = (state.time * 360) % 360;
+    ctx.font = 'bold 22px "Courier New", monospace';
+    ctx.fillStyle = `hsl(${hue},100%,65%)`;
+    ctx.fillText('⚡ LIGHTSABER ⚡', W/2, 14);
+    const barW = 220, frac = state.saberTimer / TUNE.SABER_DURATION;
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(W/2 - barW/2, 44, barW, 7);
+    ctx.fillStyle = `hsl(${hue},100%,65%)`;
+    ctx.fillRect(W/2 - barW/2, 44, barW*frac, 7);
+  } else {
+    // progress toward the saber
+    const recent = state.killTimes.length;
+    if (recent > 0) {
+      ctx.textAlign = 'center';
+      ctx.font = '12px "Courier New", monospace';
+      ctx.fillStyle = '#5d6';
+      ctx.fillText(`${recent}/${TUNE.SABER_KILL_COUNT} for saber`, W/2, 18);
+    }
+  }
+
+  // health pips (bottom-left)
+  ctx.textAlign = 'left';
+  for (let i = 0; i < TUNE.MAX_HP; i++) {
+    ctx.fillStyle = i < player.hp ? '#f55' : '#332';
+    ctx.fillRect(16 + i*22, H-30, 16, 16);
+  }
+
+  // last action label
+  if (state.lastAction && state.comboTimer > 0) {
+    ctx.globalAlpha = Math.min(1, state.comboTimer / TUNE.COMBO_WINDOW);
+    ctx.font = '12px "Courier New", monospace';
+    ctx.fillStyle = '#667';
+    ctx.fillText(`> ${state.lastAction}`, 16, 78);
+    ctx.globalAlpha = 1;
+  }
+
+  // controls hint (bottom-right, faint)
+  ctx.textAlign = 'right';
+  ctx.font = '11px "Courier New", monospace';
+  ctx.fillStyle = '#445';
+  ctx.fillText('A/D move · W jump · S/Shift slide · L-click melee · R-click shoot', W-16, H-22);
+}
+
+function drawDeath() {
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = 'rgba(10,10,16,0.78)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f55';
+  ctx.font = 'bold 64px "Courier New", monospace';
+  ctx.fillText('DEAD', W/2, H/2 - 120);
+
+  const mins = Math.floor(state.time/60);
+  const secs = (state.time%60).toFixed(1);
+  ctx.fillStyle = '#fff';
+  ctx.font = '28px "Courier New", monospace';
+  ctx.fillText(`SCORE  ${state.score}`, W/2, H/2 - 20);
+  ctx.fillStyle = '#aab';
+  ctx.font = '20px "Courier New", monospace';
+  ctx.fillText(`SURVIVED  ${mins}m ${secs}s`, W/2, H/2 + 20);
+  ctx.fillText(`KILLS  ${state.kills}`, W/2, H/2 + 50);
+
+  ctx.fillStyle = '#7f8';
+  ctx.font = '22px "Courier New", monospace';
+  ctx.globalAlpha = 0.6 + 0.4*Math.sin(state.time*4);
+  ctx.fillText('PRESS ENTER TO RESTART', W/2, H/2 + 110);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+}
+
+/* ============================================================================
+   Main loop — delta-time, frame-rate independent.
+   ============================================================================ */
+restart();
+let lastT = performance.now();
+function loop(now) {
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  if (dt > 0.05) dt = 0.05;            // clamp after tab-out
+
+  if (!state.dead) {
+    state.time += dt;
+    updatePlayer(dt);
+    updateSaber(dt);
+    updateEnemies(dt);
+    updateBullets(dt);
+    if (melee) { melee.timer -= dt; if (melee.timer <= 0) melee = null; }
+    // keep terrain generated around the player, then ease the camera to follow
+    updateChunks();
+    const targetX = player.x - W/2;
+    cam.x += (targetX - cam.x) * Math.min(1, dt * TUNE.CAM_SMOOTH);
+  }
+  updateParticles(dt);
+
+  render();
+
+  keysPressedThisFrame = {};
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

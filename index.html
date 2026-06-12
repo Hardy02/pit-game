@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PIT — Multiplayer</title>
+<style>
+  html, body { margin:0; padding:0; background:#0d0d12; height:100%; overflow:hidden; font-family:'Courier New', monospace; }
+  #wrap { width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+  canvas { background:#14141c; box-shadow:0 0 40px rgba(0,0,0,0.6); image-rendering:pixelated; cursor:crosshair; }
+  /* join overlay */
+  #join {
+    position:fixed; inset:0; background:rgba(10,10,16,0.92); display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:18px; color:#cdd; z-index:10;
+  }
+  #join h1 { font-size:72px; margin:0; letter-spacing:18px; color:#fff; text-shadow:0 0 20px #39f; }
+  #join p { margin:0; color:#778; font-size:14px; max-width:520px; text-align:center; line-height:1.6; }
+  #join input {
+    background:#1c1c28; border:2px solid #34344a; color:#fff; font-family:inherit; font-size:20px;
+    padding:10px 16px; width:280px; text-align:center; outline:none; border-radius:4px;
+  }
+  #join input:focus { border-color:#5af; }
+  #join button {
+    background:#2a6; border:none; color:#fff; font-family:inherit; font-size:22px; font-weight:bold;
+    padding:12px 40px; cursor:pointer; border-radius:4px; letter-spacing:2px;
+  }
+  #join button:hover { background:#3c8; }
+  #status { color:#a55; font-size:13px; min-height:16px; }
+  .controls { color:#556; font-size:12px; line-height:1.7; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1200" height="800"></canvas>
+</div>
+
+<div id="join">
+  <h1>PIT</h1>
+  <p>Free-for-all arena deathmatch. Out-move and out-shoot everyone else.<br>
+     String together 5 quick kills to earn a <b style="color:#5f5">lightsaber</b> that one-shots anyone it touches.</p>
+  <input id="name" maxlength="14" placeholder="your name" autocomplete="off">
+  <button id="play">PLAY</button>
+  <div id="status"></div>
+  <div class="controls">
+    A / D — move &nbsp;·&nbsp; W — jump (double-jump) &nbsp;·&nbsp; S / Shift — slide<br>
+    hold into a wall while airborne — wall-run &nbsp;·&nbsp; left-click — melee &nbsp;·&nbsp; right-click — shoot
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================================
+   PIT multiplayer client
+   - Simulates the LOCAL player's movement locally (responsive feel).
+   - Streams local state to the server; renders remote players from snapshots.
+   - Health / kills / deaths are server-authoritative; we claim hits and the
+     server validates and applies them.
+
+   Movement tuning lives in TUNE near the top, same as the single-player build.
+   ============================================================================ */
+const TUNE = {
+  VIEW_W: 1200, VIEW_H: 800,
+
+  // friction = fraction of velocity retained per second, applied pow(f, dt)
+  GROUND_FRICTION: 0.00008, AIR_FRICTION: 0.04, SLIDE_FRICTION: 0.18,
+
+  MOVE_ACCEL: 4200, AIR_ACCEL: 2600, MAX_RUN_SPEED: 430,
+  GRAVITY: 2600, MAX_FALL_SPEED: 1500,
+
+  JUMP_FORCE: 850, DOUBLE_JUMP_FORCE: 760, JUMP_CUT: 0.45,
+  COYOTE_TIME: 0.10, JUMP_BUFFER: 0.12,
+
+  SLIDE_SPEED: 620, SLIDE_DURATION: 0.42, SLIDE_HEIGHT_MULT: 0.5,
+
+  WALLRUN_DURATION: 0.55, WALLRUN_GRAVITY: 260, WALLRUN_SPEED_BOOST: 240,
+  WALLRUN_VMAX: 520, WALLJUMP_X: 620, WALLJUMP_Y: 780, WALL_STICK_RANGE: 14,
+
+  MELEE_RANGE: 82, MELEE_ARC: 1.8, MELEE_DURATION: 0.12, MELEE_COOLDOWN: 0.16,
+  RANGED_COOLDOWN: 0.5, BULLET_SPEED: 1050, BULLET_LIFETIME: 1.4, BULLET_RADIUS: 5,
+
+  PLAYER_W: 26, PLAYER_H: 52,
+
+  // lightsaber (client-side; earned by 5 quick kills)
+  SABER_KILL_COUNT: 5, SABER_KILL_WINDOW: 6.0, SABER_DURATION: 8.0,
+  SABER_LENGTH: 170, SABER_WIDTH: 22, SABER_HIT_CD: 0.12,
+
+  NET_SEND_HZ: 22,            // how often we stream our state
+  REMOTE_LERP: 0.30,          // smoothing toward remote players' latest snapshot
+};
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = TUNE.VIEW_W, H = TUNE.VIEW_H;
+const FLOOR_Y = H - 40;       // top of the arena floor
+
+function fit() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+/* ---------------------------- Networking ---------------------------- */
+let ws = null;
+const net = {
+  connected: false, id: null, room: '', maxHp: 100,
+  map: null, mapName: '', roundEndsAt: 0, warmup: false, need: 2,
+  others: new Map(),    // id -> remote player render state
+  me: null,             // server-authoritative bits about us (hp, dead, score)
+};
+
+function connect(name) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}`);
+  ws.onopen = () => { ws.send(JSON.stringify({ t: 'join', name })); };
+  ws.onclose = () => { net.connected = false; setStatus('disconnected — refresh to rejoin'); };
+  ws.onerror = () => { setStatus('connection error — is the server running?'); };
+  ws.onmessage = (ev) => onServerMessage(JSON.parse(ev.data));
+}
+function sendMsg(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+function onServerMessage(m) {
+  switch (m.t) {
+    case 'welcome':
+      net.connected = true; net.id = m.id; net.room = m.room; net.maxHp = m.maxHp;
+      loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
+      player.x = m.spawn[0]; player.y = m.spawn[1]; player.vx = player.vy = 0;
+      hideJoin();
+      break;
+    case 'mapChange':
+      loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
+      bullets.length = 0; fx.length = 0;
+      break;
+    case 'respawn':
+      player.x = m.x; player.y = m.y; player.vx = player.vy = 0;
+      player.dead = false;
+      break;
+    case 'snap': {
+      net.roundEndsAt = m.roundEndsAt;
+      net.warmup = !!m.warmup; net.need = m.need || 2;
+      const seen = new Set();
+      for (const ps of m.players) {
+        seen.add(ps.id);
+        if (ps.id === net.id) {
+          net.me = ps;                 // our authoritative hp/score/dead/invuln
+          player.dead = !!ps.d;
+          continue;
+        }
+        let r = net.others.get(ps.id);
+        if (!r) { r = { x: ps.x, y: ps.y }; net.others.set(ps.id, r); }
+        // store target; we lerp toward it each frame
+        r.tx = ps.x; r.ty = ps.y; r.vx = ps.vx; r.vy = ps.vy;
+        r.name = ps.n; r.facing = ps.f; r.aim = ps.a; r.hp = ps.hp;
+        r.dead = ps.d; r.score = ps.s; r.sliding = ps.sl; r.wallrun = ps.wr;
+        r.saber = ps.sb; r.invuln = ps.iv;
+        if (r.x === undefined) { r.x = ps.x; r.y = ps.y; }
+      }
+      for (const id of net.others.keys()) if (!seen.has(id)) net.others.delete(id);
+      break;
+    }
+    case 'kill':
+      pushKillFeed(m.killerName, m.victimName, m.weapon);
+      if (m.victim === net.id) { state.shake = 14; state.flash = 0.6; }
+      if (m.killer === net.id) {
+        state.killTimes.push(state.time);
+        spawnBurst(player.x, player.y + player.h/2, '#6f6', 14, 280);
+      }
+      break;
+    case 'fx':
+      spawnRemoteFx(m);
+      break;
+    case 'join': pushFeed(`${m.name} joined`); break;
+    case 'leave': net.others.delete(m.id); break;
+  }
+}
+
+function loadMap(map, name) {
+  net.map = map; net.mapName = name;
+  // build solid list: interior platforms + floor (sides/ceiling handled by clamp)
+  obstacles = map.plats.map(p => ({ x: p[0], y: p[1], w: p[2], h: p[3] }));
+}
+
+/* ---------------------------- Input ---------------------------- */
+const keys = {};
+const mouse = { x: W/2, y: H/2 };
+let keysPressedThisFrame = {};
+let jumpBufferTimer = 0;
+let queueMelee = false, queueRanged = false;
+
+window.addEventListener('keydown', e => {
+  if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+  const k = e.key.toLowerCase();
+  const isEdge = !keys[k];
+  if (isEdge) keysPressedThisFrame[k] = true;
+  keys[k] = true;
+  if (isEdge && (k === 'w' || k === ' ')) jumpBufferTimer = TUNE.JUMP_BUFFER;
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+function mousePos(e) {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) / r.width * W;
+  mouse.y = (e.clientY - r.top) / r.height * H;
+}
+canvas.addEventListener('mousemove', mousePos);
+canvas.addEventListener('mousedown', e => {
+  mousePos(e);
+  if (e.button === 0) queueMelee = true;
+  if (e.button === 2) queueRanged = true;
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+function aimAngle() {
+  return Math.atan2(mouse.y - (player.y + player.h/2), mouse.x - player.x);
+}
+
+/* ---------------------------- Local player ---------------------------- */
+let obstacles = [];
+const player = {
+  x: W/2, y: FLOOR_Y - TUNE.PLAYER_H, vx: 0, vy: 0,
+  w: TUNE.PLAYER_W, h: TUNE.PLAYER_H, facing: 1,
+  onGround: false, jumpsUsed: 0, coyoteTimer: 0,
+  sliding: false, slideTimer: 0,
+  wallRunning: false, wallSide: 0, wallTimer: 0,
+  meleeCooldown: 0, rangedCooldown: 0,
+  dead: false, trail: [],
+};
+
+const state = {
+  time: 0, shake: 0, flash: 0,
+  killTimes: [], saberTimer: 0, lastSaberHit: {},
+};
+
+let bullets = [];       // local, real (do hit detection)
+let rbullets = [];      // remote, visual-only
+let particles = [];
+let fx = [];            // transient melee swing visuals (local + remote)
+let melee = null;
+const killFeed = [];
+
+/* ---------------------------- Collision ---------------------------- */
+function playerRect() {
+  const h = player.sliding ? player.h * TUNE.SLIDE_HEIGHT_MULT : player.h;
+  return { x: player.x - player.w/2, y: player.y + (player.h - h), w: player.w, h: h };
+}
+function aabb(a, b) { return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+
+function collideWorld(dt) {
+  player.onGround = false;
+  let wallSide = 0;
+  const floor = { x: 0, y: FLOOR_Y, w: W, h: H - FLOOR_Y };
+  const solids = obstacles.concat([floor]);
+  const r = playerRect();
+
+  // horizontal
+  let nx = r.x + player.vx * dt;
+  let nxRect = { x: nx, y: r.y, w: r.w, h: r.h };
+  for (const s of solids) {
+    if (aabb(nxRect, s)) {
+      if (player.vx > 0) { nx = s.x - r.w; wallSide = 1; }
+      else if (player.vx < 0) { nx = s.x + s.w; wallSide = -1; }
+      player.vx = 0; nxRect.x = nx;
+    }
+  }
+  // arena side walls
+  if (nx < 0) { nx = 0; wallSide = -1; player.vx = 0; }
+  if (nx + r.w > W) { nx = W - r.w; wallSide = 1; player.vx = 0; }
+  player.x = nx + r.w/2;
+
+  // vertical
+  const r2 = playerRect();
+  let ny = r2.y + player.vy * dt;
+  let nyRect = { x: r2.x, y: ny, w: r2.w, h: r2.h };
+  for (const s of solids) {
+    if (aabb(nyRect, s)) {
+      if (player.vy > 0) { ny = s.y - r2.h; player.onGround = true; player.vy = 0; }
+      else if (player.vy < 0) { ny = s.y + s.h; player.vy = 0; }
+      nyRect.y = ny;
+    }
+  }
+  if (ny < 0) { ny = 0; player.vy = 0; }
+  player.y = ny - (player.h - r2.h);
+  player.wallContact = wallSide;
+}
+
+function wallBeside() {
+  const r = playerRect();
+  const pl = { x: r.x - TUNE.WALL_STICK_RANGE, y: r.y + 4, w: TUNE.WALL_STICK_RANGE, h: r.h - 8 };
+  const pr = { x: r.x + r.w, y: r.y + 4, w: TUNE.WALL_STICK_RANGE, h: r.h - 8 };
+  let side = 0;
+  for (const s of obstacles) { if (aabb(pl, s)) side = -1; if (aabb(pr, s)) side = 1; }
+  if (r.x <= TUNE.WALL_STICK_RANGE) side = -1;
+  if (r.x + r.w >= W - TUNE.WALL_STICK_RANGE) side = 1;
+  return side;
+}
+
+/* ---------------------------- Player update ---------------------------- */
+function updatePlayer(dt) {
+  if (player.dead) { player.trail.length = 0; return; }  // wait for respawn
+
+  const inputX = (keys['d'] || keys['arrowright'] ? 1 : 0) - (keys['a'] || keys['arrowleft'] ? 1 : 0);
+  player.meleeCooldown = Math.max(0, player.meleeCooldown - dt);
+  player.rangedCooldown = Math.max(0, player.rangedCooldown - dt);
+  if (jumpBufferTimer > 0) jumpBufferTimer -= dt;
+
+  if (player.onGround) { player.coyoteTimer = TUNE.COYOTE_TIME; player.jumpsUsed = 0; }
+  else player.coyoteTimer = Math.max(0, player.coyoteTimer - dt);
+
+  // wall run
+  const sideWall = wallBeside();
+  if (!player.onGround && !player.wallRunning && sideWall !== 0 && inputX === sideWall && player.wallTimer <= 0) {
+    player.wallRunning = true; player.wallSide = sideWall; player.wallTimer = TUNE.WALLRUN_DURATION;
+    player.vy = -TUNE.WALLRUN_SPEED_BOOST; player.jumpsUsed = 0;
+  }
+  if (player.wallRunning) {
+    player.wallTimer -= dt;
+    player.vy += TUNE.WALLRUN_GRAVITY * dt;
+    player.vy = Math.max(-TUNE.WALLRUN_VMAX, Math.min(player.vy, TUNE.MAX_FALL_SPEED));
+    player.vx = player.wallSide * 30; player.facing = -player.wallSide;
+    if (player.wallTimer <= 0 || wallBeside() !== player.wallSide || inputX === -player.wallSide) {
+      player.wallRunning = false; player.wallTimer = 0.05;
+    }
+  } else if (player.wallTimer > 0) player.wallTimer -= dt;
+
+  // slide
+  if (player.sliding) {
+    player.slideTimer -= dt;
+    if (player.slideTimer <= 0 || (!player.onGround && !player.wallRunning && player.vy > 200)) player.sliding = false;
+  }
+  if ((keysPressedThisFrame['s'] || keysPressedThisFrame['shift']) && !player.sliding && (Math.abs(player.vx) > 60 || inputX !== 0)) {
+    player.sliding = true; player.slideTimer = TUNE.SLIDE_DURATION;
+    const dir = inputX !== 0 ? inputX : player.facing;
+    player.facing = dir; player.vx += dir * TUNE.SLIDE_SPEED;
+    spawnBurst(player.x, player.y + player.h, '#fc6', 8, 120);
+  }
+
+  // horizontal movement
+  if (!player.wallRunning) {
+    if (inputX !== 0) player.facing = inputX;
+    const accel = player.onGround ? TUNE.MOVE_ACCEL : TUNE.AIR_ACCEL;
+    if (inputX !== 0 && !player.sliding) {
+      player.vx += inputX * accel * dt;
+      if (Math.abs(player.vx) > TUNE.MAX_RUN_SPEED && Math.sign(player.vx) === inputX) {
+        player.vx -= inputX * accel * dt;
+        player.vx = Math.sign(player.vx) * Math.max(TUNE.MAX_RUN_SPEED, Math.abs(player.vx) - 200*dt);
+      }
+    }
+    if (player.sliding) player.vx *= Math.pow(TUNE.SLIDE_FRICTION, dt);
+    else if (player.onGround) { if (inputX === 0) player.vx *= Math.pow(TUNE.GROUND_FRICTION, dt); }
+    else { if (inputX === 0) player.vx *= Math.pow(TUNE.AIR_FRICTION, dt); }
+  }
+
+  // gravity
+  if (!player.wallRunning) {
+    player.vy += TUNE.GRAVITY * dt;
+    if (player.vy > TUNE.MAX_FALL_SPEED) player.vy = TUNE.MAX_FALL_SPEED;
+  }
+
+  // jump / double / wall jump
+  if (jumpBufferTimer > 0) {
+    if (player.wallRunning) {
+      player.vy = -TUNE.WALLJUMP_Y; player.vx = -player.wallSide * TUNE.WALLJUMP_X;
+      player.wallRunning = false; player.wallTimer = 0.05; player.jumpsUsed = 1; jumpBufferTimer = 0;
+      spawnBurst(player.x + player.wallSide*player.w/2, player.y + player.h/2, '#9cf', 10, 180);
+    } else if (player.onGround || player.coyoteTimer > 0) {
+      player.vy = -TUNE.JUMP_FORCE; player.jumpsUsed = 1; player.onGround = false;
+      player.coyoteTimer = 0; player.sliding = false; jumpBufferTimer = 0;
+    } else if (player.jumpsUsed < 2) {
+      player.vy = -TUNE.DOUBLE_JUMP_FORCE; player.jumpsUsed = 2; jumpBufferTimer = 0;
+      spawnBurst(player.x, player.y + player.h, '#8df', 8, 140);
+    }
+  }
+  if (!keys[' '] && !keys['w'] && player.vy < 0 && !player.wallRunning) player.vy *= Math.pow(TUNE.JUMP_CUT, dt*30);
+
+  // combat
+  if (queueMelee && player.meleeCooldown <= 0) { doMelee(); player.meleeCooldown = TUNE.MELEE_COOLDOWN; }
+  queueMelee = false;
+  if (queueRanged && player.rangedCooldown <= 0) { doRanged(); player.rangedCooldown = TUNE.RANGED_COOLDOWN; }
+  queueRanged = false;
+
+  collideWorld(dt);
+  if (player.onGround && player.wallRunning) player.wallRunning = false;
+
+  player.trail.push({ x: player.x, y: player.y + player.h/2 });
+  if (player.trail.length > 16) player.trail.shift();
+
+  state.shake = Math.max(0, state.shake - dt * 40);
+  state.flash = Math.max(0, state.flash - dt * 2.5);
+}
+
+/* ---------------------------- Combat ---------------------------- */
+function doMelee() {
+  const ang = aimAngle();
+  const mx = player.x, my = player.y + player.h/2;
+  melee = { ang, timer: TUNE.MELEE_DURATION, x: mx, y: my };
+  sendMsg({ t: 'fx', kind: 'swing', x: mx, y: my, ang });
+  for (const [id, r] of net.others) {
+    if (r.dead) continue;
+    const dx = r.x - mx, dy = r.y - my;
+    if (Math.hypot(dx, dy) > TUNE.MELEE_RANGE + 20) continue;
+    let da = Math.atan2(dy, dx) - ang;
+    while (da > Math.PI) da -= Math.PI*2;
+    while (da < -Math.PI) da += Math.PI*2;
+    if (Math.abs(da) <= TUNE.MELEE_ARC/2) sendMsg({ t: 'hit', target: id, weapon: 'melee' });
+  }
+  state.shake = Math.max(state.shake, 4);
+}
+
+function doRanged() {
+  const ang = aimAngle();
+  const ox = player.x, oy = player.y + player.h/2;
+  bullets.push({ x: ox, y: oy, vx: Math.cos(ang)*TUNE.BULLET_SPEED, vy: Math.sin(ang)*TUNE.BULLET_SPEED, life: TUNE.BULLET_LIFETIME });
+  sendMsg({ t: 'fx', kind: 'fire', x: ox, y: oy, ang });
+  player.vx -= Math.cos(ang) * 40; player.vy -= Math.sin(ang) * 25;
+  spawnBurst(ox + Math.cos(ang)*20, oy + Math.sin(ang)*20, '#fe7', 3, 200);
+}
+
+function updateBullets(dt) {
+  // local bullets — collide with walls + remote players (claim hits)
+  for (const b of bullets) {
+    b.life -= dt; b.x += b.vx*dt; b.y += b.vy*dt;
+    if (b.x < 0 || b.x > W || b.y < 0 || b.y > FLOOR_Y) { b.life = 0; continue; }
+    let hit = false;
+    for (const s of obstacles) if (b.x>s.x && b.x<s.x+s.w && b.y>s.y && b.y<s.y+s.h) { hit = true; break; }
+    if (hit) { spawnBurst(b.x, b.y, '#fe7', 4, 200); b.life = 0; continue; }
+    for (const [id, r] of net.others) {
+      if (r.dead) continue;
+      const dx = r.x - b.x, dy = (r.y + player.h/2) - b.y;
+      if (dx*dx + dy*dy < 26*26) { sendMsg({ t: 'hit', target: id, weapon: 'ranged' }); spawnBurst(b.x, b.y, '#f86', 6, 220); b.life = 0; break; }
+    }
+  }
+  bullets = bullets.filter(b => b.life > 0);
+
+  // remote bullets — visual only
+  for (const b of rbullets) {
+    b.life -= dt; b.x += b.vx*dt; b.y += b.vy*dt;
+    if (b.x < 0 || b.x > W || b.y < 0 || b.y > FLOOR_Y) b.life = 0;
+  }
+  rbullets = rbullets.filter(b => b.life > 0);
+}
+
+/* ---------------------------- Lightsaber (local) ---------------------------- */
+function distPointSeg(px, py, ax, ay, bx, by) {
+  const dx = bx-ax, dy = by-ay, l2 = dx*dx+dy*dy;
+  let t = l2 ? ((px-ax)*dx + (py-ay)*dy)/l2 : 0; t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px-(ax+t*dx), py-(ay+t*dy));
+}
+function updateSaber(dt) {
+  // earn it: SABER_KILL_COUNT kills within window
+  state.killTimes = state.killTimes.filter(t => state.time - t <= TUNE.SABER_KILL_WINDOW);
+  if (state.saberTimer <= 0 && state.killTimes.length >= TUNE.SABER_KILL_COUNT) {
+    state.saberTimer = TUNE.SABER_DURATION; state.killTimes = [];
+    state.flash = 1; state.shake = Math.max(state.shake, 12);
+    spawnBurst(player.x, player.y + player.h/2, '#5f5', 24, 320);
+  }
+  if (state.saberTimer <= 0 || player.dead) return;
+  state.saberTimer -= dt;
+  const ang = aimAngle();
+  const ax = player.x, ay = player.y + player.h/2;
+  const bx = ax + Math.cos(ang)*TUNE.SABER_LENGTH, by = ay + Math.sin(ang)*TUNE.SABER_LENGTH;
+  for (const [id, r] of net.others) {
+    if (r.dead) continue;
+    if (distPointSeg(r.x, r.y + player.h/2, ax, ay, bx, by) < TUNE.SABER_WIDTH/2 + 18) {
+      const last = state.lastSaberHit[id] || -9;
+      if (state.time - last >= TUNE.SABER_HIT_CD) { sendMsg({ t: 'hit', target: id, weapon: 'saber' }); state.lastSaberHit[id] = state.time; }
+    }
+  }
+}
+
+/* ---------------------------- FX / particles ---------------------------- */
+function spawnBurst(x, y, color, count, speed = 200) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random()*Math.PI*2, s = speed*(0.3+Math.random()*0.7);
+    particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s-40, life: 0.3+Math.random()*0.4, maxLife: 0.7, color, r: 2+Math.random()*2 });
+  }
+}
+function updateParticles(dt) {
+  for (const p of particles) { p.life -= dt; p.vy += 600*dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vx *= Math.pow(0.001, dt); }
+  particles = particles.filter(p => p.life > 0);
+  for (const f of fx) f.timer -= dt;
+  fx = fx.filter(f => f.timer > 0);
+}
+function spawnRemoteFx(m) {
+  if (m.kind === 'fire') {
+    rbullets.push({ x: m.x, y: m.y, vx: Math.cos(m.ang)*TUNE.BULLET_SPEED, vy: Math.sin(m.ang)*TUNE.BULLET_SPEED, life: TUNE.BULLET_LIFETIME });
+    spawnBurst(m.x + Math.cos(m.ang)*16, m.y + Math.sin(m.ang)*16, '#fe7', 2, 160);
+  } else if (m.kind === 'swing') {
+    fx.push({ kind: 'swing', x: m.x, y: m.y, ang: m.ang, timer: TUNE.MELEE_DURATION });
+  }
+}
+
+/* ---------------------------- Kill feed ---------------------------- */
+function pushKillFeed(killer, victim, weapon) {
+  const icon = weapon === 'saber' ? '⚡' : weapon === 'melee' ? '⚔' : '➶';
+  killFeed.unshift({ text: `${killer} ${icon} ${victim}`, t: state.time });
+  if (killFeed.length > 6) killFeed.pop();
+}
+function pushFeed(text) { killFeed.unshift({ text, t: state.time, plain: true }); if (killFeed.length > 6) killFeed.pop(); }
+
+/* ---------------------------- Rendering ---------------------------- */
+function render() {
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#14141c'; ctx.fillRect(0,0,W,H);
+
+  if (state.saberTimer > 0) { ctx.fillStyle = '#3fa'; ctx.globalAlpha = 0.05; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1; }
+  if (state.flash > 0)      { ctx.fillStyle = '#f44'; ctx.globalAlpha = state.flash*0.18; ctx.fillRect(0,0,W,H); ctx.globalAlpha = 1; }
+
+  ctx.save();
+  if (state.shake > 0) ctx.translate((Math.random()-0.5)*state.shake, (Math.random()-0.5)*state.shake);
+
+  // floor
+  ctx.fillStyle = '#23232f'; ctx.fillRect(0, FLOOR_Y, W, H-FLOOR_Y);
+  ctx.fillStyle = '#2d2d3d'; ctx.fillRect(0, FLOOR_Y, W, 4);
+  // platforms
+  for (const s of obstacles) {
+    ctx.fillStyle = '#262633'; ctx.fillRect(s.x, s.y, s.w, s.h);
+    ctx.fillStyle = '#34344a'; ctx.fillRect(s.x, s.y, s.w, 4);
+    ctx.fillStyle = '#1c1c27'; ctx.fillRect(s.x, s.y, 3, s.h); ctx.fillRect(s.x+s.w-3, s.y, 3, s.h);
+  }
+  ctx.strokeStyle = '#30303f'; ctx.lineWidth = 4; ctx.strokeRect(2,2,W-4,H-4);
+
+  // particles
+  for (const p of particles) { ctx.globalAlpha = Math.max(0,p.life/p.maxLife); ctx.fillStyle = p.color; ctx.fillRect(p.x-p.r,p.y-p.r,p.r*2,p.r*2); }
+  ctx.globalAlpha = 1;
+
+  // bullets (local + remote)
+  for (const b of bullets.concat(rbullets)) {
+    ctx.fillStyle = '#ffe27a'; ctx.beginPath(); ctx.arc(b.x,b.y,TUNE.BULLET_RADIUS,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,226,122,0.4)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(b.x,b.y); ctx.lineTo(b.x-b.vx*0.02,b.y-b.vy*0.02); ctx.stroke();
+  }
+
+  // remote players
+  for (const r of net.others.values()) {
+    if (r.x === undefined) continue;
+    // smooth toward latest snapshot
+    r.x += (r.tx - r.x) * TUNE.REMOTE_LERP;
+    r.y += (r.ty - r.y) * TUNE.REMOTE_LERP;
+    if (!r.dead) drawCharacter(r.x, r.y, r.facing, r.aim, '#ff8f6b', r.name, r.hp, r.saber, r.sliding, r.invuln, false);
+  }
+
+  // remote swing fx
+  for (const f of fx) {
+    if (f.kind !== 'swing') continue;
+    const a = f.timer / TUNE.MELEE_DURATION;
+    ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.ang); ctx.globalAlpha = a*0.8;
+    ctx.fillStyle = '#cfe8ff'; ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,TUNE.MELEE_RANGE,-TUNE.MELEE_ARC/2,TUNE.MELEE_ARC/2); ctx.closePath(); ctx.fill();
+    ctx.restore(); ctx.globalAlpha = 1;
+  }
+
+  // local player
+  if (!player.dead) {
+    const hp = net.me ? net.me.hp : net.maxHp;
+    const iv = net.me ? net.me.iv : 0;
+    if (state.combo >= 3) {}
+    if (state.saberTimer > 0 && player.trail.length > 1) {}
+    drawCharacter(player.x, player.y, player.facing, aimAngle(), '#8fd0ff', null, hp, state.saberTimer>0?1:0, player.sliding, iv, true);
+    drawSaber();
+    // local melee arc
+    if (melee) {
+      const a = melee.timer/TUNE.MELEE_DURATION;
+      ctx.save(); ctx.translate(melee.x, melee.y); ctx.rotate(melee.ang); ctx.globalAlpha = a*0.9;
+      ctx.fillStyle = state.saberTimer>0 ? '#bfffe0' : '#cfe8ff';
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,TUNE.MELEE_RANGE,-TUNE.MELEE_ARC/2,TUNE.MELEE_ARC/2); ctx.closePath(); ctx.fill();
+      ctx.restore(); ctx.globalAlpha = 1;
+    }
+  }
+
+  ctx.restore();
+  drawHUD();
+  if (player.dead) drawRespawn();
+}
+
+function drawCharacter(px, py, facing, aim, color, name, hp, saber, sliding, invuln, isLocal) {
+  const h = sliding ? player.h * TUNE.SLIDE_HEIGHT_MULT : player.h;
+  const top = py + (player.h - h), bot = py + player.h, halfW = player.w/2;
+  if (invuln) ctx.globalAlpha = 0.45 + 0.2*Math.sin(state.time*30);
+
+  ctx.fillStyle = saber ? (isLocal ? '#bfffe0' : '#bfffcf') : color;
+  ctx.beginPath();
+  ctx.moveTo(px-halfW, top+halfW); ctx.arc(px, top+halfW, halfW, Math.PI, 0);
+  ctx.lineTo(px+halfW, bot-halfW); ctx.arc(px, bot-halfW, halfW, 0, Math.PI); ctx.closePath(); ctx.fill();
+
+  // eye toward aim
+  ctx.fillStyle = '#14141c';
+  ctx.beginPath(); ctx.arc(px+Math.cos(aim)*6, top+halfW+4+Math.sin(aim)*4, 4, 0, Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // name + hp bar above remote players
+  if (name) {
+    ctx.textAlign = 'center'; ctx.font = '12px "Courier New", monospace';
+    ctx.fillStyle = '#cdd'; ctx.fillText(name, px, top - 22);
+    const bw = 40;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(px-bw/2, top-14, bw, 5);
+    ctx.fillStyle = hp > 50 ? '#5d6' : hp > 25 ? '#fd5' : '#f55';
+    ctx.fillRect(px-bw/2, top-14, bw*Math.max(0,hp)/net.maxHp, 5);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawSaber() {
+  if (state.saberTimer <= 0) return;
+  const ang = aimAngle(), ax = player.x, ay = player.y + player.h/2;
+  const bx = ax + Math.cos(ang)*TUNE.SABER_LENGTH, by = ay + Math.sin(ang)*TUNE.SABER_LENGTH;
+  const hue = (state.time*360)%360;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = `hsla(${hue},100%,70%,0.25)`; ctx.lineWidth = TUNE.SABER_WIDTH+16; ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+  ctx.strokeStyle = `hsla(${hue},100%,65%,0.7)`;  ctx.lineWidth = TUNE.SABER_WIDTH;    ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+  ctx.strokeStyle = '#fff';                        ctx.lineWidth = TUNE.SABER_WIDTH*0.4; ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke();
+  ctx.lineCap = 'butt';
+}
+
+function drawHUD() {
+  ctx.setTransform(1,0,0,1,0,0); ctx.textBaseline = 'top';
+
+  // map + round timer (top center)
+  ctx.textAlign = 'center';
+  ctx.font = '16px "Courier New", monospace'; ctx.fillStyle = '#9ab';
+  ctx.fillText(net.mapName || '', W/2, 12);
+  if (net.warmup) {
+    const count = net.others.size + 1;
+    ctx.font = '13px "Courier New", monospace'; ctx.fillStyle = '#fd6';
+    ctx.fillText(`WARMUP — waiting for players (${count}/${net.need})`, W/2, 32);
+  } else {
+    const remain = Math.max(0, Math.ceil((net.roundEndsAt - Date.now())/1000));
+    ctx.font = '13px "Courier New", monospace'; ctx.fillStyle = '#667';
+    ctx.fillText(`${Math.floor(remain/60)}:${String(remain%60).padStart(2,'0')}`, W/2, 32);
+  }
+
+  // scoreboard (top right) — all players sorted by score
+  const board = [];
+  if (net.me) board.push({ name: 'YOU', score: net.me.s, me: true });
+  for (const r of net.others.values()) board.push({ name: r.name, score: r.score || 0 });
+  board.sort((a,b) => b.score - a.score);
+  ctx.textAlign = 'right'; ctx.font = '13px "Courier New", monospace';
+  let yy = 12;
+  ctx.fillStyle = '#778'; ctx.fillText(`ROOM ${net.room} · ${board.length} players`, W-16, yy); yy += 20;
+  for (const e of board.slice(0, 8)) {
+    ctx.fillStyle = e.me ? '#8fd0ff' : '#bcd';
+    ctx.fillText(`${e.name}  ${e.score}`, W-16, yy); yy += 17;
+  }
+
+  // health bar (bottom left)
+  ctx.textAlign = 'left';
+  const hp = net.me ? net.me.hp : net.maxHp;
+  const bw = 220;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(16, H-34, bw, 16);
+  ctx.fillStyle = hp > 50 ? '#5d6' : hp > 25 ? '#fd5' : '#f55';
+  ctx.fillRect(16, H-34, bw*Math.max(0,hp)/net.maxHp, 16);
+  ctx.fillStyle = '#fff'; ctx.font = '12px "Courier New", monospace';
+  ctx.fillText(`HP ${Math.max(0,hp)|0}`, 22, H-32);
+
+  // saber status / progress (bottom center)
+  ctx.textAlign = 'center';
+  if (state.saberTimer > 0) {
+    const hue = (state.time*360)%360;
+    ctx.font = 'bold 18px "Courier New", monospace'; ctx.fillStyle = `hsl(${hue},100%,65%)`;
+    ctx.fillText('⚡ LIGHTSABER ⚡', W/2, H-40);
+    const sw = 200, frac = state.saberTimer/TUNE.SABER_DURATION;
+    ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(W/2-sw/2, H-18, sw, 6);
+    ctx.fillStyle = `hsl(${hue},100%,65%)`; ctx.fillRect(W/2-sw/2, H-18, sw*frac, 6);
+  } else if (state.killTimes.length > 0) {
+    ctx.font = '12px "Courier New", monospace'; ctx.fillStyle = '#5d6';
+    ctx.fillText(`${state.killTimes.length}/${TUNE.SABER_KILL_COUNT} kills for saber`, W/2, H-28);
+  }
+
+  // kill feed (left, under nothing)
+  ctx.textAlign = 'left'; ctx.font = '13px "Courier New", monospace';
+  let fy = 70;
+  for (const k of killFeed) {
+    const age = state.time - k.t;
+    if (age > 5) continue;
+    ctx.globalAlpha = Math.max(0, 1 - (age-3)/2);
+    ctx.fillStyle = k.plain ? '#566' : '#bcd';
+    ctx.fillText(k.text, 16, fy); fy += 18;
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawRespawn() {
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = 'rgba(10,10,16,0.6)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#f55'; ctx.font = 'bold 48px "Courier New", monospace';
+  ctx.fillText('DOWN', W/2, H/2 - 40);
+  ctx.fillStyle = '#aab'; ctx.font = '18px "Courier New", monospace';
+  ctx.fillText('respawning…', W/2, H/2 + 16);
+  ctx.textAlign = 'left';
+}
+
+/* ---------------------------- Networking send loop ---------------------------- */
+let lastSend = 0;
+function maybeSendState(now) {
+  if (!net.connected) return;
+  if (now - lastSend < 1000/TUNE.NET_SEND_HZ) return;
+  lastSend = now;
+  sendMsg({
+    t: 'state', x: player.x, y: player.y, vx: player.vx, vy: player.vy,
+    facing: player.facing, aim: aimAngle(),
+    sl: player.sliding ? 1 : 0, wr: player.wallRunning ? 1 : 0, saber: state.saberTimer > 0 ? 1 : 0,
+  });
+}
+
+/* ---------------------------- Main loop ---------------------------- */
+let lastT = performance.now();
+function loop(now) {
+  let dt = (now - lastT)/1000; lastT = now;
+  if (dt > 0.05) dt = 0.05;
+
+  if (net.connected && net.map) {
+    state.time += dt;
+    updatePlayer(dt);
+    updateSaber(dt);
+    updateBullets(dt);
+    if (melee) { melee.timer -= dt; if (melee.timer <= 0) melee = null; }
+    maybeSendState(now);
+  }
+  updateParticles(dt);
+  render();
+
+  keysPressedThisFrame = {};
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ---------------------------- Join overlay ---------------------------- */
+const joinEl = document.getElementById('join');
+const nameEl = document.getElementById('name');
+const playBtn = document.getElementById('play');
+function setStatus(s) { document.getElementById('status').textContent = s; }
+function hideJoin() { joinEl.style.display = 'none'; canvas.focus(); }
+function startGame() {
+  // Common mistake: opening index.html as a file. There's no server to reach.
+  if (location.protocol === 'file:') {
+    setStatus('Don’t open the file directly. Run "node server.js", then visit http://localhost:3000');
+    return;
+  }
+  const name = (nameEl.value || 'Player').trim().slice(0, 14) || 'Player';
+  setStatus('connecting…');
+  connect(name);
+}
+playBtn.addEventListener('click', startGame);
+nameEl.addEventListener('keydown', e => { if (e.key === 'Enter') startGame(); });
+nameEl.focus();
+</script>
+</body>
+</html>

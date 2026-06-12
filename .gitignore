@@ -1,0 +1,16 @@
+# Dependencies (none currently, but just in case)
+node_modules/
+
+# Logs / temp
+*.log
+*.out
+*.err
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/
