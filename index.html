@@ -57,6 +57,7 @@
   <h1>PIT</h1>
   <p>Free-for-all arena deathmatch. Out-move and out-shoot everyone else.<br>
      String together 5 quick kills to earn a <b style="color:#5f5">lightsaber</b> that one-shots anyone it touches.<br>
+     Each kill heals you +20. Grab power-ups that spawn around the map: <b style="color:#5cf">shield</b>, <b style="color:#5f6">medkit</b>, <b style="color:#b6f">cloak</b>, <b style="color:#fd4">speed</b>.<br>
      Empty servers are filled with <b style="color:#fc6">bots</b> so you're never alone.</p>
   <input id="name" maxlength="14" placeholder="your name" autocomplete="off">
   <div class="modepick">
@@ -98,6 +99,7 @@ const TUNE = {
 
   MOVE_ACCEL: 5200, AIR_ACCEL: 3300, MAX_RUN_SPEED: 430,
   GRAVITY: 2600, MAX_FALL_SPEED: 1500,
+  SPEED_MULT: 1.5,            // lightning power-up movement multiplier (matches server)
 
   JUMP_FORCE: 850, DOUBLE_JUMP_FORCE: 760, JUMP_CUT: 0.45,
   COYOTE_TIME: 0.10, JUMP_BUFFER: 0.12,
@@ -153,6 +155,7 @@ const net = {
   map: null, mapName: '', roundEndsAt: 0, warmup: false, need: 2,
   others: new Map(),    // id -> remote player render state
   me: null,             // server-authoritative bits about us (hp, dead, score)
+  pickups: new Map(),   // id -> { kind, x, y } active power-ups on the map
 };
 
 function connect(opts) {
@@ -176,6 +179,8 @@ function onServerMessage(m) {
       net.connected = true; net.id = m.id; net.room = m.room; net.maxHp = m.maxHp;
       net.mode = m.mode || 'mini'; net.code = m.code || null;
       loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
+      net.pickups.clear();
+      if (m.pickups) for (const it of m.pickups) net.pickups.set(it.id, { kind: it.kind, x: it.x, y: it.y });
       player.x = m.spawn[0]; player.y = m.spawn[1]; player.vx = player.vy = 0;
       updateCamera();
       hideJoin();
@@ -192,7 +197,7 @@ function onServerMessage(m) {
       break;
     case 'mapChange':
       loadMap(m.map, m.mapName); net.roundEndsAt = m.roundEndsAt;
-      bullets.length = 0; fx.length = 0;
+      bullets.length = 0; fx.length = 0; net.pickups.clear();
       state.roundBannerText = m.winnerName
         ? `ROUND OVER — ${m.winnerName} wins (${m.winnerScore})`
         : 'ROUND OVER';
@@ -221,6 +226,7 @@ function onServerMessage(m) {
         r.name = ps.n; r.facing = ps.f; r.aim = ps.a; r.hp = ps.hp;
         r.dead = ps.d; r.score = ps.s; r.sliding = ps.sl; r.wallrun = ps.wr;
         r.saber = ps.sb; r.invuln = ps.iv;
+        r.shield = ps.shd; r.cloak = ps.clk; r.speed = ps.spd;
         if (r.x === undefined) { r.x = ps.x; r.y = ps.y; }
       }
       for (const id of net.others.keys()) if (!seen.has(id)) net.others.delete(id);
@@ -237,10 +243,29 @@ function onServerMessage(m) {
     case 'fx':
       spawnRemoteFx(m);
       break;
+    case 'pickupSpawn':
+      net.pickups.set(m.id, { kind: m.kind, x: m.x, y: m.y });
+      break;
+    case 'pickupGot': {
+      const it = net.pickups.get(m.id);
+      net.pickups.delete(m.id);
+      // play the grab effect on whoever collected it
+      const who = m.by === net.id ? player : net.others.get(m.by);
+      if (who && who.x !== undefined) {
+        const px = who.x, py = who.y + player.h/2;
+        if (m.kind === 'medic') spawnHearts(px, who.y);
+        else spawnBurst(px, py, PICKUP_COLOR[m.kind] || '#fff', 14, 240);
+      } else if (it) {
+        spawnBurst(it.x, it.y, PICKUP_COLOR[m.kind] || '#fff', 10, 200);
+      }
+      break;
+    }
     case 'join': pushFeed(`${m.name} joined`); break;
     case 'leave': net.others.delete(m.id); break;
   }
 }
+
+const PICKUP_COLOR = { shield: '#5cf', medic: '#5f6', cloak: '#b6f', lightning: '#fd4' };
 
 function loadMap(map, name) {
   net.map = map; net.mapName = name;
@@ -411,15 +436,17 @@ function updatePlayer(dt) {
     spawnBurst(player.x, player.y + player.h, '#fc6', 8, 120);
   }
 
-  // horizontal movement
+  // horizontal movement (lightning power-up = 1.5x accel + top speed)
+  const speedMul = (net.me && net.me.spd) ? TUNE.SPEED_MULT : 1;
   if (!player.wallRunning) {
     if (inputX !== 0) player.facing = inputX;
-    const accel = player.onGround ? TUNE.MOVE_ACCEL : TUNE.AIR_ACCEL;
+    const accel = (player.onGround ? TUNE.MOVE_ACCEL : TUNE.AIR_ACCEL) * speedMul;
+    const maxRun = TUNE.MAX_RUN_SPEED * speedMul;
     if (inputX !== 0 && !player.sliding) {
       player.vx += inputX * accel * dt;
-      if (Math.abs(player.vx) > TUNE.MAX_RUN_SPEED && Math.sign(player.vx) === inputX) {
+      if (Math.abs(player.vx) > maxRun && Math.sign(player.vx) === inputX) {
         player.vx -= inputX * accel * dt;
-        player.vx = Math.sign(player.vx) * Math.max(TUNE.MAX_RUN_SPEED, Math.abs(player.vx) - 200*dt);
+        player.vx = Math.sign(player.vx) * Math.max(maxRun, Math.abs(player.vx) - 200*dt);
       }
     }
     if (player.sliding) player.vx *= Math.pow(TUNE.SLIDE_FRICTION, dt);
@@ -591,8 +618,24 @@ function spawnBurst(x, y, color, count, speed = 200) {
     particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s-40, life: 0.3+Math.random()*0.4, maxLife: 0.7, color, r: 2+Math.random()*2 });
   }
 }
+// medic kit: little hearts that converge into the player ("entering" them)
+function spawnHearts(cx, topY) {
+  const tx = cx, ty = topY + player.h/2;
+  for (let i = 0; i < 10; i++) {
+    const a = Math.random()*Math.PI*2, dist = 36 + Math.random()*46;
+    particles.push({
+      x: tx + Math.cos(a)*dist, y: ty + Math.sin(a)*dist + 10,
+      tx, ty, home: true, heart: true,
+      life: 0.55 + Math.random()*0.5, maxLife: 1.05, color: '#ff5e7a', r: 5 + Math.random()*3,
+    });
+  }
+}
 function updateParticles(dt) {
-  for (const p of particles) { p.life -= dt; p.vy += 600*dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vx *= Math.pow(0.001, dt); }
+  for (const p of particles) {
+    p.life -= dt;
+    if (p.home) { const k = Math.min(1, dt*7); p.x += (p.tx - p.x)*k; p.y += (p.ty - p.y)*k; }
+    else { p.vy += 600*dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vx *= Math.pow(0.001, dt); }
+  }
   particles = particles.filter(p => p.life > 0);
   for (const f of fx) f.timer -= dt;
   fx = fx.filter(f => f.timer > 0);
@@ -641,8 +684,15 @@ function render() {
   ctx.strokeStyle = '#30303f'; ctx.lineWidth = 4; ctx.strokeRect(2,2,world.w-4,world.h-4);
 
   // particles
-  for (const p of particles) { ctx.globalAlpha = Math.max(0,p.life/p.maxLife); ctx.fillStyle = p.color; ctx.fillRect(p.x-p.r,p.y-p.r,p.r*2,p.r*2); }
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life/p.maxLife);
+    if (p.heart) drawHeart(p.x, p.y, p.r*2.4, p.color);
+    else { ctx.fillStyle = p.color; ctx.fillRect(p.x-p.r,p.y-p.r,p.r*2,p.r*2); }
+  }
   ctx.globalAlpha = 1;
+
+  // power-up pickups
+  for (const it of net.pickups.values()) drawPickup(it);
 
   // bullets (local + remote)
   for (const b of bullets.concat(rbullets)) {
@@ -653,8 +703,11 @@ function render() {
 
   // remote players (positions are advanced in updateRemotes)
   for (const r of net.others.values()) {
-    if (r.x === undefined) continue;
-    if (!r.dead) drawCharacter(r.x, r.y, r.facing, r.aim, '#ff8f6b', r.name, r.hp, r.saber, r.sliding, r.invuln, false);
+    if (r.x === undefined || r.dead) continue;
+    if (r.cloak) continue;                       // cloaked enemies are invisible to us
+    if (r.shield) drawShieldAura(r.x, r.y);
+    drawCharacter(r.x, r.y, r.facing, r.aim, '#ff8f6b', r.name, r.hp, r.saber, r.sliding, r.invuln, false);
+    if (r.speed) drawSpeedSparks(r.x, r.y);
   }
 
   // remote swing fx
@@ -670,9 +723,14 @@ function render() {
   if (!player.dead) {
     const hp = net.me ? net.me.hp : net.maxHp;
     const iv = net.me ? net.me.iv : 0;
-    if (state.combo >= 3) {}
-    if (state.saberTimer > 0 && player.trail.length > 1) {}
+    const meCloak = net.me && net.me.clk, meShield = net.me && net.me.shd, meSpeed = net.me && net.me.spd;
+    if (meCloak) drawCape(player.x, player.y, player.facing, player.vx);
+    if (meShield) drawShieldAura(player.x, player.y);
+    // when cloaked you see yourself faintly (enemies don't see you at all)
+    if (meCloak) ctx.globalAlpha = 0.35;
     drawCharacter(player.x, player.y, player.facing, aimAngle(), '#8fd0ff', null, hp, state.saberTimer>0?1:0, player.sliding, iv, true);
+    ctx.globalAlpha = 1;
+    if (meSpeed) drawSpeedSparks(player.x, player.y);
     drawSaber();
     // local melee arc
     if (melee) {
@@ -687,6 +745,76 @@ function render() {
   ctx.restore();
   drawHUD();
   if (player.dead) drawRespawn();
+}
+
+/* ---------------------------- Power-up visuals ---------------------------- */
+function drawHeart(x, y, size, color) {
+  const r = size * 0.28;
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x - r, y - r*0.2, r, 0, Math.PI*2); ctx.arc(x + r, y - r*0.2, r, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(x - 2*r, y); ctx.lineTo(x + 2*r, y); ctx.lineTo(x, y + size*0.62); ctx.closePath(); ctx.fill();
+}
+
+function drawPickup(it) {
+  const t = state.time;
+  const x = it.x, y = it.y + Math.sin(t*3 + it.x*0.05)*4, R = 16;
+  const col = PICKUP_COLOR[it.kind] || '#fff';
+  ctx.globalAlpha = 0.22 + 0.1*Math.sin(t*6);
+  ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, R + 9, 0, Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#15151f'; ctx.beginPath(); ctx.arc(x, y, R, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = col;
+  if (it.kind === 'shield') {
+    ctx.beginPath(); ctx.moveTo(x, y-9); ctx.lineTo(x+8, y-5); ctx.lineTo(x+8, y+2);
+    ctx.lineTo(x, y+10); ctx.lineTo(x-8, y+2); ctx.lineTo(x-8, y-5); ctx.closePath(); ctx.fill();
+  } else if (it.kind === 'medic') {
+    ctx.fillRect(x-3, y-9, 6, 18); ctx.fillRect(x-9, y-3, 18, 6);
+  } else if (it.kind === 'cloak') {
+    ctx.beginPath(); ctx.moveTo(x, y-9); ctx.quadraticCurveTo(x+11, y+2, x+5, y+10);
+    ctx.lineTo(x-5, y+10); ctx.quadraticCurveTo(x-11, y+2, x, y-9); ctx.closePath(); ctx.fill();
+  } else if (it.kind === 'lightning') {
+    ctx.beginPath(); ctx.moveTo(x+4, y-10); ctx.lineTo(x-6, y+1); ctx.lineTo(x, y+1);
+    ctx.lineTo(x-4, y+10); ctx.lineTo(x+7, y-3); ctx.lineTo(x+1, y-3); ctx.closePath(); ctx.fill();
+  }
+  ctx.lineWidth = 1;
+}
+
+function drawShieldAura(px, py) {
+  const cy = py + player.h/2, t = state.time, rad = player.h*0.62;
+  ctx.save();
+  ctx.globalAlpha = 0.20 + 0.08*Math.sin(t*8);
+  ctx.fillStyle = '#7ddfff'; ctx.beginPath(); ctx.arc(px, cy, rad, 0, Math.PI*2); ctx.fill();
+  ctx.globalAlpha = 0.6; ctx.strokeStyle = '#bff0ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(px, cy, rad, 0, Math.PI*2); ctx.stroke();
+  ctx.restore(); ctx.globalAlpha = 1;
+}
+
+function drawCape(px, py, facing, vx) {
+  const t = state.time, topY = py + 8, botY = py + player.h, back = -facing;
+  const sway = Math.sin(t*6)*4 + clamp(-vx*0.03, -10, 10);
+  const baseX = px + back*6;
+  ctx.save();
+  ctx.fillStyle = '#08080e';
+  ctx.beginPath();
+  ctx.moveTo(px - player.w/2, topY);
+  ctx.lineTo(px + player.w/2, topY);
+  ctx.quadraticCurveTo(baseX + back*24 + sway, (topY+botY)/2, baseX + back*16 + sway, botY + 12);
+  ctx.quadraticCurveTo(baseX + sway*0.5, botY + 6, px - player.w/2, botY);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(130,130,170,0.25)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
+}
+
+function drawSpeedSparks(px, py) {
+  const cy = py + player.h/2, t = state.time;
+  ctx.save(); ctx.strokeStyle = '#ffd64a'; ctx.lineWidth = 2; ctx.globalAlpha = 0.85;
+  for (let i = 0; i < 3; i++) {
+    const a = t*20 + i*2.1, r = 20 + i*7;
+    const x1 = px + Math.cos(a)*r, y1 = cy + Math.sin(a)*r;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - 5, y1 + 7); ctx.lineTo(x1 + 2, y1 + 4); ctx.stroke();
+  }
+  ctx.restore(); ctx.globalAlpha = 1;
 }
 
 function drawCharacter(px, py, facing, aim, color, name, hp, saber, sliding, invuln, isLocal) {

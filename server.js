@@ -42,6 +42,19 @@ const DMG = { melee: 50, ranged: 25, saber: 1000 };
 const BOT_DMG = { melee: 34, ranged: 14 };
 const MELEE_MAX_DIST = 170;    // server-side sanity check for melee claims
 const MAX_HP = 100;
+const KILL_HEAL = 20;          // hp restored to the attacker for each kill
+
+// Power-up pickups that spawn around the map.
+const PICKUP = {
+  INTERVAL: Number(process.env.PICKUP_INTERVAL_MS) || 10000,   // ms between spawns
+  MAX: 6,            // max concurrent pickups on a map
+  RADIUS: 36,        // collect distance (pickup point → player centre)
+  SHIELD_MS: 3000,   // damage immunity
+  CLOAK_MS: 10000,   // invisibility
+  SPEED_MS: 8000,    // 1.5x movement
+  SPEED_MULT: 1.5,
+};
+const PICKUP_KINDS = ['shield', 'medic', 'cloak', 'lightning'];
 
 /* Game modes. "mini" = the classic single-screen arena. "maxi" = a much larger
    world that scrolls with the player and holds more combatants. Each mode has its
@@ -245,6 +258,8 @@ function makeRoom(mode, opts = {}) {
     private: !!opts.private, code: opts.code || null,
     players: new Map(),         // id -> player or bot
     bbullets: [],               // server-simulated bot bullets
+    pickups: [],                // active power-up pickups
+    nextPickupAt: Date.now() + PICKUP.INTERVAL,
     mapIndex: Math.floor(Math.random() * maps.length),
     roundEndsAt: Date.now() + ROUND_TIME * 1000,
   };
@@ -260,6 +275,10 @@ function computeSolids(room) {
   room.world = { w: W, h: H, floorY };
   room.plats = m.plats.map(p => ({ x: p[0], y: p[1], w: p[2], h: p[3] }));
   room.solids = room.plats.concat([{ x: 0, y: floorY, w: W, h: H - floorY + 200 }]);
+  // candidate spots for pickups: a little above each platform top + along the floor
+  room.pickupSpots = m.plats.map(p => ({ x: p[0] + p[2] / 2, y: p[1] - 18 }));
+  const n = Math.max(3, Math.round(W / 320));
+  for (let i = 1; i <= n; i++) room.pickupSpots.push({ x: Math.round(W * i / (n + 1)), y: floorY - 18 });
 }
 
 function humanCount(room) { let n = 0; for (const p of room.players.values()) if (!p.isBot) n++; return n; }
@@ -338,12 +357,14 @@ function closeConn(conn) {
 function applyDamage(room, attacker, victim, weapon, now) {
   if (!attacker || !victim || victim.dead || victim.id === attacker.id) return;
   if (now < victim.invulnUntil) return;
+  if (now < (victim.shieldUntil || 0)) return;   // shield power-up: full immunity
   const table = attacker.isBot ? BOT_DMG : DMG;
   victim.hp -= (table[weapon] || 0);
   if (victim.hp <= 0) {
     victim.dead = true;
     victim.respawnAt = now + RESPAWN_TIME;
     attacker.score += 1;
+    attacker.hp = Math.min(MAX_HP, attacker.hp + KILL_HEAL);   // reward: heal on kill
     broadcast(room, { t: 'kill', killer: attacker.id, killerName: attacker.name, victim: victim.id, victimName: victim.name, weapon });
   }
 }
@@ -403,6 +424,7 @@ function doJoin(conn, msg) {
     sl: 0, wr: 0, saber: 0,
     hp: MAX_HP, dead: false, score: 0,
     respawnAt: 0, invulnUntil: Date.now() + SPAWN_PROTECT,
+    shieldUntil: 0, cloakUntil: 0, speedUntil: 0,
   };
   conn.player = player;
   room.players.set(player.id, player);
@@ -415,6 +437,7 @@ function doJoin(conn, msg) {
     roundEndsAt: room.roundEndsAt,
     spawn: [sx, sy],
     maxHp: MAX_HP,
+    pickups: room.pickups,
   });
   broadcast(room, { t: 'join', id: player.id, name: player.name }, player.id);
 }
@@ -446,6 +469,7 @@ function addBot(room) {
     sl: 0, wr: 0, saber: 0,
     hp: MAX_HP, dead: false, score: 0,
     respawnAt: 0, invulnUntil: Date.now() + SPAWN_PROTECT,
+    shieldUntil: 0, cloakUntil: 0, speedUntil: 0,
     onGround: false, jumpsUsed: 0, meleeCd: 0, rangedCd: 0,
     prefDist: 240 + Math.random() * 180,   // preferred fighting distance
     err: 0.5 + Math.random() * 0.9,        // aim wobble multiplier (lower = sharper)
@@ -550,10 +574,11 @@ function updateBot(bot, room, dt, now) {
   if (bot.onGround) bot.jumpsUsed = 0;
 
   const cx = bot.x, cy = bot.y + bot.h / 2;
-  // nearest living enemy
+  // nearest living, visible enemy (cloaked players can't be seen/targeted)
   let tgt = null, bd = Infinity;
   for (const p of room.players.values()) {
     if (p.id === bot.id || p.dead) continue;
+    if (now < (p.cloakUntil || 0)) continue;
     const dx = p.x - bot.x, dy = p.y - bot.y, d = dx * dx + dy * dy;
     if (d < bd) { bd = d; tgt = p; }
   }
@@ -590,9 +615,11 @@ function updateBot(bot, room, dt, now) {
     inputX = bot.wander || 0;
   }
 
-  // integrate physics
-  const accel = bot.onGround ? PHYS.MOVE_ACCEL : PHYS.AIR_ACCEL;
-  if (inputX !== 0) { bot.vx += inputX * accel * dt; bot.vx = Math.max(-PHYS.MAX_RUN, Math.min(PHYS.MAX_RUN, bot.vx)); }
+  // integrate physics (lightning power-up = 1.5x move speed)
+  const sp = now < (bot.speedUntil || 0) ? PICKUP.SPEED_MULT : 1;
+  const accel = (bot.onGround ? PHYS.MOVE_ACCEL : PHYS.AIR_ACCEL) * sp;
+  const maxRun = PHYS.MAX_RUN * sp;
+  if (inputX !== 0) { bot.vx += inputX * accel * dt; bot.vx = Math.max(-maxRun, Math.min(maxRun, bot.vx)); }
   else if (bot.onGround) bot.vx *= Math.pow(PHYS.GROUND_FRICTION, dt);
   else bot.vx *= Math.pow(PHYS.AIR_FRICTION, dt);
   bot.vy += PHYS.GRAVITY * dt; if (bot.vy > PHYS.MAX_FALL) bot.vy = PHYS.MAX_FALL;
@@ -626,6 +653,54 @@ function stepBullets(room, dt, now) {
 }
 
 /* ============================================================================
+   Power-up pickups
+   ============================================================================ */
+let pickupSeq = 1;
+
+function spawnPickup(room, now) {
+  const spots = room.pickupSpots;
+  if (!spots || !spots.length) return;
+  // try a few times to find a spot not already occupied by another pickup
+  let spot = null;
+  for (let tries = 0; tries < 8; tries++) {
+    const s = spots[Math.floor(Math.random() * spots.length)];
+    if (!room.pickups.some(it => Math.abs(it.x - s.x) < 40 && Math.abs(it.y - s.y) < 40)) { spot = s; break; }
+  }
+  if (!spot) return;
+  const kind = PICKUP_KINDS[Math.floor(Math.random() * PICKUP_KINDS.length)];
+  const it = { id: pickupSeq++, kind, x: spot.x, y: spot.y };
+  room.pickups.push(it);
+  broadcast(room, { t: 'pickupSpawn', id: it.id, kind: it.kind, x: it.x, y: it.y });
+}
+
+function applyPickup(room, p, it, now) {
+  switch (it.kind) {
+    case 'shield':    p.shieldUntil = now + PICKUP.SHIELD_MS; break;
+    case 'medic':     p.hp = MAX_HP; break;
+    case 'cloak':     p.cloakUntil = now + PICKUP.CLOAK_MS; break;
+    case 'lightning': p.speedUntil = now + PICKUP.SPEED_MS; break;
+  }
+}
+
+// detect players/bots walking over pickups
+function collectPickups(room, now) {
+  if (!room.pickups.length) return;
+  for (const p of room.players.values()) {
+    if (p.dead) continue;
+    for (let i = room.pickups.length - 1; i >= 0; i--) {
+      const it = room.pickups[i];
+      if (p.isBot && it.kind === 'cloak') continue;   // bots don't take cloak (no invisible bots)
+      const dx = it.x - p.x, dy = it.y - (p.y + p.h / 2);
+      if (dx * dx + dy * dy < PICKUP.RADIUS * PICKUP.RADIUS) {
+        applyPickup(room, p, it, now);
+        room.pickups.splice(i, 1);
+        broadcast(room, { t: 'pickupGot', id: it.id, kind: it.kind, by: p.id });
+      }
+    }
+  }
+}
+
+/* ============================================================================
    Server loops
    ============================================================================ */
 // Logic tick: bot population, respawns, physics/bots, bot bullets, map rotation
@@ -652,6 +727,7 @@ setInterval(() => {
         const [sx, sy] = spawnAt(room);
         p.dead = false; p.hp = MAX_HP; p.x = sx; p.y = sy; p.vx = 0; p.vy = 0;
         p.invulnUntil = now + SPAWN_PROTECT;
+        p.shieldUntil = 0; p.cloakUntil = 0; p.speedUntil = 0;   // power-ups don't carry through death
         if (p.isBot) { p.onGround = false; p.jumpsUsed = 0; }
         if (p.conn) send(p.conn, { t: 'respawn', x: sx, y: sy });
       }
@@ -661,6 +737,13 @@ setInterval(() => {
     for (const p of room.players.values()) if (p.isBot && !p.dead) { try { updateBot(p, room, dt, now); } catch (e) {} }
     stepBullets(room, dt, now);
 
+    // spawn + collect power-ups
+    if (now >= room.nextPickupAt) {
+      room.nextPickupAt = now + PICKUP.INTERVAL;
+      if (room.pickups.length < PICKUP.MAX) spawnPickup(room, now);
+    }
+    collectPickups(room, now);
+
     // round / map rotation
     if (now >= room.roundEndsAt) {
       let winner = null, best = -1;
@@ -669,10 +752,13 @@ setInterval(() => {
       room.roundEndsAt = now + ROUND_TIME * 1000;
       computeSolids(room);
       room.bbullets.length = 0;
+      room.pickups.length = 0;
+      room.nextPickupAt = now + PICKUP.INTERVAL;
       for (const p of room.players.values()) {
         const [sx, sy] = spawnAt(room);
         p.score = 0; p.hp = MAX_HP; p.dead = false; p.x = sx; p.y = sy; p.vx = 0; p.vy = 0;
         p.invulnUntil = now + SPAWN_PROTECT;
+        p.shieldUntil = 0; p.cloakUntil = 0; p.speedUntil = 0;
         if (p.isBot) { p.onGround = false; p.jumpsUsed = 0; }
       }
       broadcast(room, {
@@ -701,6 +787,9 @@ setInterval(() => {
         hp: p.hp, d: p.dead ? 1 : 0, s: p.score,
         sl: p.sl, wr: p.wr, sb: p.saber,
         iv: now < p.invulnUntil ? 1 : 0,
+        shd: now < (p.shieldUntil || 0) ? 1 : 0,
+        clk: now < (p.cloakUntil || 0) ? 1 : 0,
+        spd: now < (p.speedUntil || 0) ? 1 : 0,
       });
     }
     const snap = { t: 'snap', players, roundEndsAt: room.roundEndsAt, warmup: !!room.warmup, need: 1 };
