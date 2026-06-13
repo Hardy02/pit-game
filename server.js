@@ -37,6 +37,9 @@ const ROUND_TIME    = 180;     // seconds per round (3 minutes) before rotating
 const RESPAWN_TIME  = 2000;    // ms dead before respawn
 const SPAWN_PROTECT = 1500;    // ms of invulnerability after spawning
 const DMG = { melee: 50, ranged: 25, saber: 1000 };
+// Bots hit for less than players so they pressure you without one-shotting:
+// ~3 melee hits or ~7 ranged hits to drop a full-health player.
+const BOT_DMG = { melee: 34, ranged: 14 };
 const MELEE_MAX_DIST = 170;    // server-side sanity check for melee claims
 const MAX_HP = 100;
 
@@ -60,9 +63,10 @@ const PHYS = {
 };
 const BOTCFG = {
   BULLET_SPEED: 1050, BULLET_LIFETIME: 1.4,
-  RANGED_CD: 0.6, MELEE_CD: 0.3,
+  RANGED_CD: 0.9, MELEE_CD: 0.5,   // slower attacks → more reaction time for the player
   MELEE_RANGE: 82, MELEE_ARC: 1.8,
   FIRE_RANGE: 1500,            // won't bother shooting beyond this
+  AIM_WOBBLE: 0.14,            // radians of aim error scaled per-bot (higher = misses more)
 };
 const BOT_NAMES = ['Rook','Vex','Nyx','Juno','Kilo','Wraith','Echo','Zane','Ada','Mara','Onyx','Pike','Sable','Cleo','Ravi','Dex','Bishop','Tash'];
 
@@ -334,7 +338,8 @@ function closeConn(conn) {
 function applyDamage(room, attacker, victim, weapon, now) {
   if (!attacker || !victim || victim.dead || victim.id === attacker.id) return;
   if (now < victim.invulnUntil) return;
-  victim.hp -= (DMG[weapon] || 0);
+  const table = attacker.isBot ? BOT_DMG : DMG;
+  victim.hp -= (table[weapon] || 0);
   if (victim.hp <= 0) {
     victim.dead = true;
     victim.respawnAt = now + RESPAWN_TIME;
@@ -560,7 +565,7 @@ function updateBot(bot, room, dt, now) {
     const lead = Math.min(dist / BOTCFG.BULLET_SPEED, 0.22);
     const ax = tgt.x + (tgt.vx || 0) * lead, ay = tcy + (tgt.vy || 0) * lead;
     let aim = Math.atan2(ay - cy, ax - cx);
-    aim += (Math.random() - 0.5) * 0.05 * bot.err;
+    aim += (Math.random() - 0.5) * BOTCFG.AIM_WOBBLE * bot.err;
     bot.aim = aim; bot.facing = (ax >= cx) ? 1 : -1;
 
     const pref = bot.prefDist, hdx = tcx - cx;

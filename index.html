@@ -394,16 +394,28 @@ function updatePlayer(dt) {
     }
   } else if (player.wallTimer > 0) player.wallTimer -= dt;
 
-  // slide
+  // slide / crouch
+  // "sliding" doubles as the crouched state. A tap launches a powerslide (speed
+  // boost when moving); HOLDING crouch on the ground keeps you crouched reliably
+  // instead of popping back up when the slide timer runs out.
+  const crouchHeld = !!(keys['s'] || keys['shift']);
+  const crouchEdge = !!(keysPressedThisFrame['s'] || keysPressedThisFrame['shift']);
   if (player.sliding) {
     player.slideTimer -= dt;
-    if (player.slideTimer <= 0 || (!player.onGround && !player.wallRunning && player.vy > 200)) player.sliding = false;
+    const keepCrouch = crouchHeld && player.onGround && !player.wallRunning;   // hold to stay down
+    const fellOff = !player.onGround && !player.wallRunning && player.vy > 200; // can't crouch mid-fall
+    if (fellOff || (!keepCrouch && player.slideTimer <= 0)) player.sliding = false;
   }
-  if ((keysPressedThisFrame['s'] || keysPressedThisFrame['shift']) && !player.sliding && (Math.abs(player.vx) > 60 || inputX !== 0)) {
+  if (!player.sliding && !player.wallRunning && crouchEdge && (player.onGround || Math.abs(player.vx) > 60 || inputX !== 0)) {
     player.sliding = true; player.slideTimer = TUNE.SLIDE_DURATION;
     const dir = inputX !== 0 ? inputX : player.facing;
-    player.facing = dir; player.vx += dir * TUNE.SLIDE_SPEED;
+    player.facing = dir;
+    if (Math.abs(player.vx) > 60 || !player.onGround) player.vx += dir * TUNE.SLIDE_SPEED;  // boost only when already moving
     spawnBurst(player.x, player.y + player.h, '#fc6', 8, 120);
+  }
+  // re-enter (or stay in) a plain crouch whenever the key is held on the ground
+  if (!player.sliding && !player.wallRunning && crouchHeld && player.onGround) {
+    player.sliding = true; player.slideTimer = 0;
   }
 
   // horizontal movement
@@ -430,13 +442,21 @@ function updatePlayer(dt) {
 
   // jump / double / wall jump
   if (jumpBufferTimer > 0) {
+    const touchingWall = !player.onGround ? wallBeside() : 0;   // any wall we're hugging midair
     if (player.wallRunning) {
       player.vy = -TUNE.WALLJUMP_Y; player.vx = -player.wallSide * TUNE.WALLJUMP_X;
+      player.facing = -player.wallSide; player.sliding = false;
       player.wallRunning = false; player.wallTimer = 0.05; player.jumpsUsed = 1; jumpBufferTimer = 0;
       spawnBurst(player.x + player.wallSide*player.w/2, player.y + player.h/2, '#9cf', 10, 180);
     } else if (player.onGround || player.coyoteTimer > 0) {
       player.vy = -TUNE.JUMP_FORCE; player.jumpsUsed = 1; player.onGround = false;
       player.coyoteTimer = 0; player.sliding = false; jumpBufferTimer = 0;
+    } else if (touchingWall !== 0) {
+      // airborne and pressed against a wall → always allow a wall jump (even after a double jump)
+      player.vy = -TUNE.WALLJUMP_Y; player.vx = -touchingWall * TUNE.WALLJUMP_X;
+      player.facing = -touchingWall; player.sliding = false;
+      player.wallRunning = false; player.wallTimer = 0.05; player.jumpsUsed = 1; jumpBufferTimer = 0;
+      spawnBurst(player.x + touchingWall*player.w/2, player.y + player.h/2, '#9cf', 10, 180);
     } else if (player.jumpsUsed < 2) {
       player.vy = -TUNE.DOUBLE_JUMP_FORCE; player.jumpsUsed = 2; jumpBufferTimer = 0;
       spawnBurst(player.x, player.y + player.h, '#8df', 8, 140);
