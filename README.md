@@ -2,9 +2,19 @@
 
 A fast, momentum-driven browser deathmatch. Free-for-all combat with chainable
 movement (slide / wall-run / double-jump), melee + ranged attacks, and a
-lightsaber power-up you earn from a quick kill streak. Players battle across 5
-rotating maps. Built with HTML5 Canvas and a zero-dependency Node WebSocket
-server.
+lightsaber power-up you earn from a quick kill streak. Rounds last 3 minutes and
+rotate maps. Built with HTML5 Canvas and a zero-dependency Node WebSocket server.
+
+### Modes & games
+
+- **Mini PIT** — the classic single-screen arena; the whole map is visible at once.
+- **Maxi PIT** — a much larger world (2400×1500) that holds more players; the view
+  scrolls to follow your player instead of showing the whole map.
+- **Quick Play** — public matchmaking. Empty servers are automatically filled with
+  **bots** (server-simulated AI that move, chase, shoot with line-of-sight, and
+  melee) so you're never alone.
+- **Private games** — create a game to get a 4-letter code; only friends who enter
+  that code join your room. A single sparring bot keeps you company until they arrive.
 
 ## Run locally
 
