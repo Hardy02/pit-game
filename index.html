@@ -566,9 +566,18 @@ function updateSaber(dt) {
   const ang = aimAngle();
   const ax = player.x, ay = player.y + player.h/2;
   const bx = ax + Math.cos(ang)*TUNE.SABER_LENGTH, by = ay + Math.sin(ang)*TUNE.SABER_LENGTH;
+  // A target's body is ~26x52, so testing only its centre point misses blade
+  // strikes that clearly slice the head/feet. Sample the whole body height and
+  // allow for the body's half-width so a visible hit actually registers.
+  const reach = TUNE.SABER_WIDTH/2 + TUNE.PLAYER_W/2 + 12;
   for (const [id, r] of net.others) {
     if (r.dead) continue;
-    if (distPointSeg(r.x, r.y + player.h/2, ax, ay, bx, by) < TUNE.SABER_WIDTH/2 + 18) {
+    const d = Math.min(
+      distPointSeg(r.x, r.y + 8,                ax, ay, bx, by),  // head
+      distPointSeg(r.x, r.y + player.h/2,       ax, ay, bx, by),  // chest
+      distPointSeg(r.x, r.y + player.h - 8,     ax, ay, bx, by)   // feet
+    );
+    if (d < reach) {
       const last = state.lastSaberHit[id] || -9;
       if (state.time - last >= TUNE.SABER_HIT_CD) { sendMsg({ t: 'hit', target: id, weapon: 'saber' }); state.lastSaberHit[id] = state.time; }
     }
